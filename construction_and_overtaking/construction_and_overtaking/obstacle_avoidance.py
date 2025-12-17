@@ -62,8 +62,10 @@ class ObstacleAvoidance(Node):
         self.right_distance = 999.0  # Distance to white line
         self.lane_state = 0  # 0=none, 1=left only, 2=both, 3=right only
         self.front_distance = 999.0
+        self.obstacle_width = 0.0  # Width of detected obstacle
         self.left_clear = True
         self.right_clear = True
+        self.obstacle_type = "NONE"  # NONE, CONE, CAR
 
         # Parameters
         self.obstacle_threshold = 1.0  # meters
@@ -71,11 +73,17 @@ class ObstacleAvoidance(Node):
         self.lane_margin = 100.0  # pixels - minimum space to lane before avoiding
         self.avoidance_speed = 0.15  # m/s
         self.avoidance_angular = 0.3  # rad/s
+        self.cone_width_threshold = 0.15  # meters - objects narrower than this are cones
+        self.car_width_threshold = 0.4  # meters - objects wider than this are cars
 
         # Timer for control loop
         self.timer = self.create_timer(0.1, self.control_loop)
+        
+        # Timer for status logging
+        self.status_timer = self.create_timer(1.0, self.log_status)
 
         self.get_logger().info('Obstacle Avoidance Node initialized')
+        self.get_logger().info('Waiting for obstacles...')
 
     def lidar_callback(self, scan_msg):
         """Process LiDAR data to detect obstacles."""
@@ -83,7 +91,6 @@ class ObstacleAvoidance(Node):
         ranges[ranges == 0] = float('inf')  # Replace 0 with inf
 
         # Front sector: ±30 degrees (assuming 360-degree scan)
-        # Adjust indices based on your LiDAR configuration
         front_start = len(ranges) * 330 // 360
         front_end = len(ranges) * 30 // 360
         
@@ -93,6 +100,30 @@ class ObstacleAvoidance(Node):
             front_ranges = ranges[front_start:front_end]
 
         self.front_distance = np.min(front_ranges) if len(front_ranges) > 0 else 999.0
+
+        # Estimate obstacle width by counting consecutive close points
+        if self.front_distance < self.obstacle_threshold:
+            close_points = front_ranges < self.obstacle_threshold
+            if np.any(close_points):
+                # Find clusters of close points
+                clusters = self.find_clusters(close_points)
+                if len(clusters) > 0:
+                    # Get the largest cluster
+                    largest_cluster = max(clusters, key=len)
+                    # Estimate width: number of points * angular resolution * distance
+                    angular_res = scan_msg.angle_increment
+                    self.obstacle_width = len(largest_cluster) * angular_res * self.front_distance
+                    
+                    # Determine obstacle type
+                    if self.obstacle_width < self.cone_width_threshold:
+                        self.obstacle_type = "CONE"
+                    elif self.obstacle_width > self.car_width_threshold:
+                        self.obstacle_type = "CAR"
+                    else:
+                        self.obstacle_type = "OBJECT"
+        else:
+            self.obstacle_type = "NONE"
+            self.obstacle_width = 0.0
 
         # Left sector: 60-120 degrees
         left_start = len(ranges) * 60 // 360
@@ -106,6 +137,24 @@ class ObstacleAvoidance(Node):
         right_ranges = ranges[right_start:right_end]
         self.right_clear = np.min(right_ranges) > 0.5 if len(right_ranges) > 0 else True
 
+    def find_clusters(self, binary_array):
+        """Find consecutive True values in binary array."""
+        clusters = []
+        current_cluster = []
+        
+        for i, val in enumerate(binary_array):
+            if val:
+                current_cluster.append(i)
+            else:
+                if current_cluster:
+                    clusters.append(current_cluster)
+                    current_cluster = []
+        
+        if current_cluster:
+            clusters.append(current_cluster)
+        
+        return clusters
+
     def left_distance_callback(self, msg):
         """Receive distance to left (yellow) lane."""
         self.left_distance = msg.data
@@ -118,9 +167,22 @@ class ObstacleAvoidance(Node):
         """Receive lane detection state."""
         self.lane_state = msg.data
 
+    def log_status(self):
+        """Periodically log current status."""
+        if self.obstacle_type != "NONE":
+            self.get_logger().info(
+                f'[DETECTION] Obstacle: {self.obstacle_type} | '
+                f'Distance: {self.front_distance:.2f}m | '
+                f'Width: {self.obstacle_width:.2f}m'
+            )
+        else:
+            self.get_logger().info(
+                f'[CLEAR] No obstacles detected | '
+                f'Front distance: {self.front_distance:.2f}m'
+            )
+
     def control_loop(self):
         """Main control loop for state machine."""
-        # State machine logic
         if self.state == self.STATE_NORMAL:
             self.handle_normal_state()
         elif self.state == self.STATE_OBSTACLE_DETECTED:
@@ -134,39 +196,43 @@ class ObstacleAvoidance(Node):
 
     def handle_normal_state(self):
         """Normal lane following mode."""
-        # Publish that avoidance is inactive
         avoid_active = Bool()
         avoid_active.data = False
         self.pub_avoid_active.publish(avoid_active)
 
-        # Check for obstacles
         if self.front_distance < self.obstacle_threshold:
             self.state = self.STATE_OBSTACLE_DETECTED
-            self.get_logger().info('Obstacle detected! Deciding avoidance direction...')
+            self.get_logger().warn(
+                f'[ALERT] {self.obstacle_type} detected at {self.front_distance:.2f}m! '
+                f'Width: {self.obstacle_width:.2f}m'
+            )
 
     def handle_obstacle_detected_state(self):
         """Decide which direction to avoid."""
-        # Decision logic based on lane distances
         if self.left_distance < self.lane_margin:
-            # Not enough space on left, go right
             self.state = self.STATE_AVOIDING_RIGHT
-            self.get_logger().info('Avoiding RIGHT (left lane too close)')
+            self.get_logger().info(
+                f'[DECISION] Avoiding {self.obstacle_type} to the RIGHT '
+                f'(left lane too close: {self.left_distance:.0f}px)'
+            )
         elif self.right_distance < self.lane_margin:
-            # Not enough space on right, go left
             self.state = self.STATE_AVOIDING_LEFT
-            self.get_logger().info('Avoiding LEFT (right lane too close)')
+            self.get_logger().info(
+                f'[DECISION] Avoiding {self.obstacle_type} to the LEFT '
+                f'(right lane too close: {self.right_distance:.0f}px)'
+            )
         elif self.lane_state == 1:
-            # Only left lane visible, go right
             self.state = self.STATE_AVOIDING_RIGHT
-            self.get_logger().info('Avoiding RIGHT (only left lane visible)')
+            self.get_logger().info(f'[DECISION] Avoiding {self.obstacle_type} to the RIGHT (only left lane visible)')
         elif self.lane_state == 3:
-            # Only right lane visible, go left
             self.state = self.STATE_AVOIDING_LEFT
-            self.get_logger().info('Avoiding LEFT (only right lane visible)')
+            self.get_logger().info(f'[DECISION] Avoiding {self.obstacle_type} to the LEFT (only right lane visible)')
         else:
-            # Both lanes visible and enough space - default left for overtaking
             self.state = self.STATE_AVOIDING_LEFT
-            self.get_logger().info('Avoiding LEFT (default for overtaking)')
+            if self.obstacle_type == "CAR":
+                self.get_logger().info(f'[DECISION] Overtaking {self.obstacle_type} on the LEFT')
+            else:
+                self.get_logger().info(f'[DECISION] Avoiding {self.obstacle_type} to the LEFT')
 
     def handle_avoiding_left_state(self):
         """Execute left avoidance maneuver."""
@@ -176,13 +242,12 @@ class ObstacleAvoidance(Node):
 
         twist = Twist()
         twist.linear.x = self.avoidance_speed
-        twist.angular.z = self.avoidance_angular  # Turn left
+        twist.angular.z = self.avoidance_angular
         self.pub_avoid_cmd.publish(twist)
 
-        # Check if obstacle is passed
         if self.front_distance > self.clear_threshold:
             self.state = self.STATE_RETURNING
-            self.get_logger().info('Obstacle passed, returning to lane...')
+            self.get_logger().info(f'[SUCCESS] {self.obstacle_type} passed! Returning to lane...')
 
     def handle_avoiding_right_state(self):
         """Execute right avoidance maneuver."""
@@ -192,25 +257,22 @@ class ObstacleAvoidance(Node):
 
         twist = Twist()
         twist.linear.x = self.avoidance_speed
-        twist.angular.z = -self.avoidance_angular  # Turn right
+        twist.angular.z = -self.avoidance_angular
         self.pub_avoid_cmd.publish(twist)
 
-        # Check if obstacle is passed
         if self.front_distance > self.clear_threshold:
             self.state = self.STATE_RETURNING
-            self.get_logger().info('Obstacle passed, returning to lane...')
+            self.get_logger().info(f'[SUCCESS] {self.obstacle_type} passed! Returning to lane...')
 
     def handle_returning_state(self):
         """Return to center of lane."""
-        # Check if both lanes are visible and distances are balanced
-        if self.lane_state == 2:  # Both lanes visible
+        if self.lane_state == 2:
             left_right_diff = abs(self.left_distance - self.right_distance)
-            if left_right_diff < 50.0:  # Within 50 pixels of center
+            if left_right_diff < 50.0:
                 self.state = self.STATE_NORMAL
-                self.get_logger().info('Returned to lane following')
+                self.get_logger().info('[COMPLETE] Returned to normal lane following')
                 return
 
-        # Continue returning
         avoid_active = Bool()
         avoid_active.data = True
         self.pub_avoid_active.publish(avoid_active)
@@ -218,11 +280,10 @@ class ObstacleAvoidance(Node):
         twist = Twist()
         twist.linear.x = self.avoidance_speed * 0.8
         
-        # Steer towards center
         if self.left_distance < self.right_distance:
-            twist.angular.z = -0.2  # Steer right
+            twist.angular.z = -0.2
         else:
-            twist.angular.z = 0.2  # Steer left
+            twist.angular.z = 0.2
             
         self.pub_avoid_cmd.publish(twist)
 
