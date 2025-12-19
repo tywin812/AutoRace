@@ -47,6 +47,7 @@ class ControlLane(Node):
 
         self.avoid_active = False
         self.avoid_twist = Twist()
+        self.avoid_active_logged = False  # Track if we already logged the state change
 
     def callback_get_max_vel(self, max_vel_msg):
         self.MAX_VEL = max_vel_msg.data
@@ -82,11 +83,15 @@ class ControlLane(Node):
             self.pub_cmd_vel.publish(self.avoid_twist)
 
     def callback_avoid_active(self, bool_msg):
-        self.avoid_active = bool_msg.data
-        if self.avoid_active:
-            self.get_logger().info('Avoidance mode activated.')
+        # Only log when state actually changes
+        if bool_msg.data != self.avoid_active:
+            self.avoid_active = bool_msg.data
+            if self.avoid_active:
+                self.get_logger().info('Avoidance mode activated.')
+            else:
+                self.get_logger().info('Avoidance mode deactivated. Returning to lane following.')
         else:
-            self.get_logger().info('Avoidance mode deactivated. Returning to lane following.')
+            self.avoid_active = bool_msg.data
 
     def shut_down(self):
         self.get_logger().info('Shutting down. cmd_vel will be 0')
