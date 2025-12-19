@@ -1,5 +1,0 @@
-# AutoRace - Quick Start
-
-colcon build --packages-select lane_detection construction_and_overtaking
-source install/setup.bash
-ros2 launch construction_and_overtaking obstacle_avoidance.launch.py
