@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Image, CameraInfo
 from std_msgs.msg import Float64, UInt8, Bool, Header
 from geometry_msgs.msg import Twist, PoseStamped, Point
 from nav_msgs.msg import OccupancyGrid, Path, MapMetaData
 import numpy as np
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+import tf2_geometry_msgs
+from geometry_msgs.msg import PointStamped
+from cv_bridge import CvBridge
+import cv2
 
 
 class OccupancyGridNavigator(Node):
@@ -22,6 +29,19 @@ class OccupancyGridNavigator(Node):
         self.sub_left_distance = self.create_subscription(Float64, '/lane_left_distance', self.left_distance_callback, 10)
         self.sub_right_distance = self.create_subscription(Float64, '/lane_right_distance', self.right_distance_callback, 10)
         self.sub_lane_state = self.create_subscription(UInt8, '/lane_detection_state', self.lane_state_callback, 10)
+        
+        # TF Buffer
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
+        # Obstacle Memory
+        # List of (x_odom, y_odom, timestamp_ns)
+        self.obstacle_memory = []
+        self.memory_duration_ns = 5.0 * 1e9 # Keep obstacles for 5 seconds
+        
+        # Subscribe to lane paths
+        self.sub_left_path = self.create_subscription(Path, '/detect/lane_left_path', self.left_path_callback, 10)
+        self.sub_right_path = self.create_subscription(Path, '/detect/lane_right_path', self.right_path_callback, 10)
 
         # Publishers
         self.pub_cmd = self.create_publisher(Twist, '/avoid_control', 10)
@@ -37,17 +57,26 @@ class OccupancyGridNavigator(Node):
         self.right_distance = 999.0
         self.lane_state = 0
         self.current_path = []
+        self.left_lane_path = []
+        self.right_lane_path = []
+        self.last_left_path_time = rclpy.time.Time(seconds=0)
+        self.last_right_path_time = rclpy.time.Time(seconds=0)
         
         # Grid parameters
         self.grid_resolution = 0.02  # Reduced to 2cm for finer grid
         self.grid_width = 2.0
-        self.grid_length = 2.0
+        
+        # Grid X range (relative to robot)
+        self.grid_min_x = -0.5
+        self.grid_max_x = 1.5
+        self.grid_length = self.grid_max_x - self.grid_min_x
+        
         self.grid_w = int(self.grid_width / self.grid_resolution)
         self.grid_h = int(self.grid_length / self.grid_resolution)
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         
         # Robot parameters
-        self.robot_radius = 0.15  # Increased to 15cm for safety margin
+        self.robot_radius = 0.10  # 10cm (Physical limit + small margin)
         self.inflation_cells = int(np.ceil(self.robot_radius / self.grid_resolution))
         
         # Lane parameters
@@ -57,13 +86,13 @@ class OccupancyGridNavigator(Node):
         self.lane_boundary_margin = 0.08
         
         # Grid costs
-        self.forbidden_cost = 1000.0
-        self.obstacle_cost = 100.0
+        self.forbidden_cost = 100.0 # Anything >= 100 is a wall
+        self.obstacle_cost = 100.0  # Obstacles are now walls
         
         # Control parameters
-        self.speed = 0.18
-        self.steering_gain = 3.0
-        self.look_ahead_distance = 0.4
+        self.speed = 0.10
+        self.steering_gain = 1.5
+        self.look_ahead_distance = 0.3
         
         # Control timer
         self.timer = self.create_timer(0.1, self.control_loop)
@@ -89,12 +118,12 @@ class OccupancyGridNavigator(Node):
         return left_boundary, right_boundary
 
     def world_to_grid(self, x, y):
-        if x < 0 or x >= self.grid_length:
+        if x < self.grid_min_x or x >= self.grid_max_x:
             return None
         if y < -self.grid_width/2 or y >= self.grid_width/2:
             return None
             
-        row = int(x / self.grid_resolution)
+        row = int((x - self.grid_min_x) / self.grid_resolution)
         col = int((y + self.grid_width/2) / self.grid_resolution)
         
         if row < 0 or row >= self.grid_h or col < 0 or col >= self.grid_w:
@@ -103,48 +132,88 @@ class OccupancyGridNavigator(Node):
         return (row, col)
 
     def grid_to_world(self, row, col):
-        x = (row + 0.5) * self.grid_resolution
+        x = (row + 0.5) * self.grid_resolution + self.grid_min_x
         y = (col + 0.5) * self.grid_resolution - self.grid_width/2
         return (x, y)
+
+    def draw_line_on_grid(self, p1, p2):
+        # Bresenham's line algorithm to connect grid cells
+        grid_p1 = self.world_to_grid(p1[0], p1[1])
+        grid_p2 = self.world_to_grid(p2[0], p2[1])
+        
+        if grid_p1 is None or grid_p2 is None:
+            return
+
+        r0, c0 = grid_p1
+        r1, c1 = grid_p2
+        
+        dr = abs(r1 - r0)
+        dc = abs(c1 - c0)
+        sr = 1 if r0 < r1 else -1
+        sc = 1 if c0 < c1 else -1
+        err = dr - dc
+
+        while True:
+            # Draw point with thickening
+            for d_r in range(-1, 2):
+                for d_c in range(-1, 2):
+                    rr, cc = r0 + d_r, c0 + d_c
+                    if 0 <= rr < self.grid_h and 0 <= cc < self.grid_w:
+                        self.occupancy_grid[rr, cc] = self.forbidden_cost
+
+            if r0 == r1 and c0 == c1:
+                break
+            
+            e2 = 2 * err
+            if e2 > -dc:
+                err -= dc
+                r0 += sr
+            if e2 < dr:
+                err += dr
+                c0 += sc
 
     def build_occupancy_grid(self, lidar_points, stamp, frame_id):
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         
-        left_boundary, right_boundary = self.get_lane_boundaries_in_meters()
+        current_time = rclpy.time.Time.from_msg(stamp)
         
-        # Only project lane boundaries for a short distance (e.g. 1.0m)
-        # This prevents straight lines from blocking curved paths further away
-        lane_projection_length = 1.0 
+        # Draw lanes from paths (Curved)
+        # Check timeout (e.g. 0.2 seconds)
+        timeout_ns = 0.2 * 1e9
         
-        if self.lane_state > 0:
-            for row in range(self.grid_h):
-                x, y_dummy = self.grid_to_world(row, 0)
-                
-                # Skip if beyond projection length
-                if x > lane_projection_length:
-                    continue
-                    
-                for col in range(self.grid_w):
-                    x, y = self.grid_to_world(row, col)
-                    
-                    if left_boundary < 999.0 and y > left_boundary:
-                        self.occupancy_grid[row, col] = self.forbidden_cost
-                    elif right_boundary > -999.0 and y < right_boundary:
-                        self.occupancy_grid[row, col] = self.forbidden_cost
+        paths_to_draw = []
+        if (current_time.nanoseconds - self.last_left_path_time.nanoseconds) < timeout_ns:
+            paths_to_draw.append(self.left_lane_path)
         
+        if (current_time.nanoseconds - self.last_right_path_time.nanoseconds) < timeout_ns:
+            paths_to_draw.append(self.right_lane_path)
+
+        for path_points in paths_to_draw:
+            if len(path_points) < 2:
+                continue
+            # Connect consecutive points with lines
+            for i in range(len(path_points) - 1):
+                p1 = path_points[i]
+                p2 = path_points[i+1]
+                # Filter jumps: if points are too far apart (> 0.5m), don't connect them
+                dist = np.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+                if dist < 0.5:
+                    self.draw_line_on_grid(p1, p2)
+
+        # Fallback removed: Do not draw straight lines if paths are empty.
+        # This prevents hallucinating walls when lane detection is lost.
+        
+        # Draw current lidar points (override memory if needed, or add to it)
         for point in lidar_points:
             x, y = point[0], point[1]
             grid_pos = self.world_to_grid(x, y)
             if grid_pos is not None:
                 row, col = grid_pos
-                
-                # Inflate obstacles
                 for dr in range(-self.inflation_cells, self.inflation_cells + 1):
                     for dc in range(-self.inflation_cells, self.inflation_cells + 1):
                         if dr*dr + dc*dc <= self.inflation_cells*self.inflation_cells:
                             r, c = row + dr, col + dc
                             if 0 <= r < self.grid_h and 0 <= c < self.grid_w:
-                                # Don't overwrite forbidden zones (lanes) with lower cost
                                 if self.occupancy_grid[r, c] < self.forbidden_cost:
                                     self.occupancy_grid[r, c] = max(
                                         self.occupancy_grid[r, c],
@@ -157,7 +226,7 @@ class OccupancyGridNavigator(Node):
         grid_msg = OccupancyGrid()
         grid_msg.header = Header()
         # Force zero time to ensure visualization works in RViz despite TF delays
-        grid_msg.header.stamp = rclpy.time.Time().to_msg()
+        grid_msg.header.stamp = rclpy.time.Time(seconds=0).to_msg()
         grid_msg.header.frame_id = frame_id
         
         grid_msg.info = MapMetaData()
@@ -165,8 +234,8 @@ class OccupancyGridNavigator(Node):
         grid_msg.info.width = self.grid_h  # X-axis size
         grid_msg.info.height = self.grid_w # Y-axis size
         
-        # Origin is at (0, -width/2) relative to base_scan
-        grid_msg.info.origin.position.x = 0.0
+        # Origin is at (min_x, -width/2) relative to base_scan
+        grid_msg.info.origin.position.x = self.grid_min_x
         grid_msg.info.origin.position.y = -self.grid_width / 2.0
         grid_msg.info.origin.position.z = 0.0
         grid_msg.info.origin.orientation.w = 1.0
@@ -371,13 +440,37 @@ class OccupancyGridNavigator(Node):
         x_robot = -x
         y_robot = -y
         
-        mask = (x_robot > 0) & (x_robot < self.grid_length) & \
-               (np.abs(y_robot) < self.grid_width/2) & (ranges < 10.0)
+        # Filter by angle in Robot frame (Front +/- 80 degrees)
+        # This prevents seeing side walls as obstacles when turning
+        angles_robot = np.arctan2(y_robot, x_robot)
+        fov_limit = 80 * np.pi / 180
+        mask_fov = np.abs(angles_robot) < fov_limit
+        
+        mask = (x_robot > self.grid_min_x) & (x_robot < self.grid_max_x) & \
+               (np.abs(y_robot) < self.grid_width/2) & (ranges < 10.0) & mask_fov
         
         lidar_points = np.column_stack([x_robot[mask], y_robot[mask]])
+        
+        # --- Memory Update ---
+        # Removed memory update logic as requested
+        
         self.last_frame_id = "robot/base_link"
         self.last_scan_time = scan_msg.header.stamp
         self.build_occupancy_grid(lidar_points, scan_msg.header.stamp, "robot/base_link")
+
+    def left_path_callback(self, msg):
+        points = []
+        for pose in msg.poses:
+            points.append((pose.pose.position.x, pose.pose.position.y))
+        self.left_lane_path = points
+        self.last_left_path_time = rclpy.time.Time.from_msg(msg.header.stamp)
+
+    def right_path_callback(self, msg):
+        points = []
+        for pose in msg.poses:
+            points.append((pose.pose.position.x, pose.pose.position.y))
+        self.right_lane_path = points
+        self.last_right_path_time = rclpy.time.Time.from_msg(msg.header.stamp)
 
     def left_distance_callback(self, msg):
         self.left_distance = 999.0 if msg.data < 0 else msg.data
@@ -455,23 +548,18 @@ class OccupancyGridNavigator(Node):
         return np.any(roi == self.obstacle_cost)
 
     def control_loop(self):
-        # Check for obstacles first
-        if not self.check_obstacles():
-            # No obstacles, let lane follower drive
+        # Hybrid Mode Logic
+        has_obstacles = self.check_obstacles()
+        
+        if not has_obstacles:
+            # No obstacles in immediate path -> Let follow_lanes drive
             avoid_active = Bool()
             avoid_active.data = False
             self.pub_avoid_active.publish(avoid_active)
-            
-            # Publish max vel (normal speed)
-            max_vel = Float64()
-            max_vel.data = 0.22 
-            self.pub_max_vel.publish(max_vel)
-            
-            # Clear path debug
-            if hasattr(self, 'last_frame_id'):
-                self.publish_debug_path([], self.last_frame_id)
             return
 
+        # Obstacles or Walls detected -> Grid Navigator handles everything
+        
         # Dynamic Goal Selection
         # Instead of a fixed point, find the furthest reachable free space
         # Scan rows from far to near
@@ -517,7 +605,7 @@ class OccupancyGridNavigator(Node):
         
         # Fallback if no goal found (e.g. blocked)
         if goal_grid is None:
-             goal_grid = self.world_to_grid(0.5, 0.0)
+             goal_grid = self.world_to_grid(self.grid_max_x - 0.5, 0.0)
 
         if start_grid is None or goal_grid is None:
             self.stop()
@@ -544,7 +632,7 @@ class OccupancyGridNavigator(Node):
         path_msg = Path()
         path_msg.header = Header()
         # Force zero time to ensure visualization works in RViz despite TF delays
-        path_msg.header.stamp = rclpy.time.Time().to_msg()
+        path_msg.header.stamp = rclpy.time.Time(seconds=0).to_msg()
         path_msg.header.frame_id = frame_id
         
         for x, y in path:

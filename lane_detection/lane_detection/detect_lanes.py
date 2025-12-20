@@ -10,6 +10,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float64
 from std_msgs.msg import UInt8
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped
 
 
 class DetectLane(Node):
@@ -115,6 +117,10 @@ class DetectLane(Node):
         # NEW: Publishers for lane distances
         self.pub_left_distance = self.create_publisher(Float64, '/lane_left_distance', 1)
         self.pub_right_distance = self.create_publisher(Float64, '/lane_right_distance', 1)
+        
+        # NEW: Publishers for full lane paths
+        self.pub_left_path = self.create_publisher(Path, '/detect/lane_left_path', 1)
+        self.pub_right_path = self.create_publisher(Path, '/detect/lane_right_path', 1)
 
         self.cvBridge = CvBridge()
 
@@ -478,10 +484,65 @@ class DetectLane(Node):
             if white_fraction > 3000:
                 right_dist_msg.data = self.right_fitx[450] - image_center
             else:
-                right_dist_msg.data = 999.0  # Large value if line not detected
+                # Fallback: if white line is lost but we have yellow, estimate right line
+                if yellow_fraction > 3000:
+                     # Assume standard lane width (e.g. 600px)
+                     estimated_right = self.left_fitx[450] + 600
+                     right_dist_msg.data = estimated_right - image_center
+                else:
+                     right_dist_msg.data = 999.0
             
             self.pub_left_distance.publish(left_dist_msg)
             self.pub_right_distance.publish(right_dist_msg)
+            
+            # Publish Paths
+            ppm = 750.0 # pixels per meter (approx based on 450px / 0.6m)
+            
+            if yellow_fraction > 3000:
+                path_msg = Path()
+                path_msg.header.frame_id = "robot/base_link"
+                path_msg.header.stamp = self.get_clock().now().to_msg()
+                
+                # Sample points (every 20th point)
+                for i in range(0, len(ploty), 20):
+                    y_px = ploty[i]
+                    x_px = self.left_fitx[i]
+                    
+                    # Convert to Robot Frame
+                    # Image Y (0 at top) -> Robot X (Forward)
+                    # Image X (0 at left) -> Robot Y (Left)
+                    # Robot is at bottom center
+                    
+                    x_robot = (cv_image.shape[0] - y_px) / ppm
+                    y_robot = (image_center - x_px) / ppm
+                    
+                    pose = PoseStamped()
+                    pose.header = path_msg.header
+                    pose.pose.position.x = x_robot
+                    pose.pose.position.y = y_robot
+                    path_msg.poses.append(pose)
+                
+                self.pub_left_path.publish(path_msg)
+                
+            if white_fraction > 3000:
+                path_msg = Path()
+                path_msg.header.frame_id = "robot/base_link"
+                path_msg.header.stamp = self.get_clock().now().to_msg()
+                
+                for i in range(0, len(ploty), 20):
+                    y_px = ploty[i]
+                    x_px = self.right_fitx[i]
+                    
+                    x_robot = (cv_image.shape[0] - y_px) / ppm
+                    y_robot = (image_center - x_px) / ppm
+                    
+                    pose = PoseStamped()
+                    pose.header = path_msg.header
+                    pose.pose.position.x = x_robot
+                    pose.pose.position.y = y_robot
+                    path_msg.poses.append(pose)
+                
+                self.pub_right_path.publish(path_msg)
 
         self.pub_image_lane.publish(self.cvBridge.cv2_to_imgmsg(final, 'bgr8'))
 
