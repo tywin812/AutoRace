@@ -6,7 +6,7 @@ package_name = 'construction_and_overtaking'
 
 setup(
     name=package_name,
-    version='0.1.0',
+    version='0.2.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -23,7 +23,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'obstacle_avoidance = construction_and_overtaking.obstacle_avoidance:main'
+            'obstacle_avoidance = construction_and_overtaking.obstacle_avoidance:main',
+            'occupancy_grid_navigator = construction_and_overtaking.occupancy_grid_navigator:main'
         ],
     },
 )
