@@ -90,9 +90,13 @@ class OccupancyGridNavigator(Node):
         self.max_rotation_time = 5.0  # Increased since slower rotation
         self.rotating_mode = False  # Are we in rotation mode?
         
+        # Debug
+        self.lidar_received = False
+        self.obstacle_count = 0
+        
         # Control timer
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.status_timer = self.create_timer(0.5, self.log_status)
+        self.status_timer = self.create_timer(2.0, self.log_status)  # Every 2s
 
         self.get_logger().info('=== Grid Navigator with Reactive Rotation ===' )
         self.get_logger().info(f'Min passage width: {self.min_passage_width}m ({int(self.min_passage_width/self.grid_resolution)} cells)')
@@ -367,11 +371,13 @@ class OccupancyGridNavigator(Node):
                         self.occupancy_grid[row, col] = self.forbidden_cost
         
         # Draw obstacles with inflation
+        obstacle_points = 0
         for point in lidar_points:
             x, y = point[0], point[1]
             grid_pos = self.world_to_grid(x, y)
             if grid_pos is not None:
                 row, col = grid_pos
+                obstacle_points += 1
                 
                 # Inflate obstacles
                 for dr in range(-self.inflation_cells, self.inflation_cells + 1):
@@ -386,6 +392,7 @@ class OccupancyGridNavigator(Node):
                                         self.obstacle_cost
                                     )
         
+        self.obstacle_count = obstacle_points
         self.publish_debug_grid(stamp, frame_id)
 
     def publish_debug_grid(self, stamp, frame_id):
@@ -498,6 +505,8 @@ class OccupancyGridNavigator(Node):
         return simplified
 
     def lidar_callback(self, scan_msg):
+        self.lidar_received = True
+        
         ranges = np.array(scan_msg.ranges)
         ranges[ranges == 0] = float('inf')
         ranges[ranges < scan_msg.range_min] = float('inf')
@@ -564,25 +573,14 @@ class OccupancyGridNavigator(Node):
         self.lane_state = msg.data
 
     def log_status(self):
-        left_b, right_b = self.get_lane_boundaries_in_meters()
-        path_len = len(self.current_path)
+        # Debug info
+        obstacles_detected = self.check_obstacles()
         
-        # Show validation status
-        white_status = "✓" if self.white_line_valid else "✗"
-        width_px = self.left_distance + self.right_distance if (self.left_distance < 999.0 and self.right_distance < 999.0) else 0
-        
-        target_info = ""
-        if path_len > 0:
-            target = self.find_lookahead_point()
-            if target:
-                tx, ty = target
-                dist = np.sqrt(tx**2 + ty**2)
-                angle = np.arctan2(ty, tx) * 180 / np.pi
-                target_info = f"-> ({tx:.2f},{ty:.2f}) {dist:.2f}m {angle:.0f}°"
-        
-        mode = "ROTATE" if self.rotating_mode else "NORMAL"
         self.get_logger().info(
-            f'[{mode}] L={left_b:.2f} R={right_b:.2f} {white_status} | Path={path_len} {target_info}'
+            f'[DEBUG] LiDAR: {"✓" if self.lidar_received else "✗"} | '
+            f'Obstacles in grid: {self.obstacle_count} | '
+            f'check_obstacles(): {obstacles_detected} | '
+            f'Mode: {"ROTATE" if self.rotating_mode else "NORMAL"}'
         )
 
     def find_lookahead_point(self):
