@@ -14,9 +14,6 @@ class OccupancyGridNavigator(Node):
     1. Build occupancy grid from LiDAR + lane boundaries
     2. Plan path with A* every cycle
     3. Follow the path
-    
-    No checks, no optimizations, no reactive logic.
-    Just: Grid → Plan → Follow
     """
 
     def __init__(self):
@@ -38,7 +35,6 @@ class OccupancyGridNavigator(Node):
         self.right_distance = 999.0  # pixels
         self.lane_state = 0
         self.current_path = []  # Current planned path
-        self.path_waypoint_index = 0
         
         # Grid parameters
         self.grid_resolution = 0.05  # 5cm per cell
@@ -55,27 +51,25 @@ class OccupancyGridNavigator(Node):
         self.lane_boundary_margin = 0.08  # meters
         
         # Grid costs
-        self.forbidden_cost = 1000.0  # Behind lane lines - CANNOT pass
-        self.obstacle_cost = 100.0    # Obstacles - expensive
+        self.forbidden_cost = 1000.0  # Behind lane lines
+        self.obstacle_cost = 100.0    # Obstacles
         
         # Control parameters
         self.speed = 0.18
-        self.steering_gain = 2.8
-        self.waypoint_reached_threshold = 0.1  # meters
+        self.steering_gain = 3.0
+        self.look_ahead_distance = 0.4  # Look this far ahead on path
         
-        # Control timer - plan and follow every cycle
+        # Control timer
         self.timer = self.create_timer(0.1, self.control_loop)
         self.status_timer = self.create_timer(1.0, self.log_status)
 
         self.get_logger().info('=== Ultra-Pure Occupancy Grid Navigator ===')
         self.get_logger().info(f'Grid: {self.grid_w}x{self.grid_h} @ {self.grid_resolution}m')
-        self.get_logger().info('Strategy: Always plan with A*')
 
     def pixels_to_meters(self, pixel_distance):
         return pixel_distance / self.pixels_per_meter
 
     def get_lane_boundaries_in_meters(self):
-        """Get lane boundaries in meters"""
         if self.left_distance < 999.0:
             left_boundary = self.pixels_to_meters(self.left_distance) + self.lane_boundary_margin
         else:
@@ -89,7 +83,6 @@ class OccupancyGridNavigator(Node):
         return left_boundary, right_boundary
 
     def world_to_grid(self, x, y):
-        """World (meters) -> Grid (row, col)"""
         if x < 0 or x >= self.grid_length:
             return None
         if y < -self.grid_width/2 or y >= self.grid_width/2:
@@ -104,17 +97,15 @@ class OccupancyGridNavigator(Node):
         return (row, col)
 
     def grid_to_world(self, row, col):
-        """Grid (row, col) -> World (meters)"""
         x = (row + 0.5) * self.grid_resolution
         y = (col + 0.5) * self.grid_resolution - self.grid_width/2
         return (x, y)
 
     def build_occupancy_grid(self, lidar_points):
-        """Build grid: forbidden zones + obstacles"""
         # Reset
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         
-        # Mark forbidden zones (behind lane lines)
+        # Mark forbidden zones
         left_boundary, right_boundary = self.get_lane_boundaries_in_meters()
         
         if self.lane_state > 0:
@@ -122,24 +113,19 @@ class OccupancyGridNavigator(Node):
                 for col in range(self.grid_w):
                     x, y = self.grid_to_world(row, col)
                     
-                    # Beyond left line
                     if left_boundary < 999.0 and y > left_boundary:
                         self.occupancy_grid[row, col] = self.forbidden_cost
-                    
-                    # Beyond right line
                     elif right_boundary > -999.0 and y < right_boundary:
                         self.occupancy_grid[row, col] = self.forbidden_cost
         
-        # Mark obstacles from LiDAR
+        # Mark obstacles
         for point in lidar_points:
             x, y = point[0], point[1]
             grid_pos = self.world_to_grid(x, y)
             if grid_pos is not None:
                 row, col = grid_pos
                 
-                # Don't overwrite forbidden zones
                 if self.occupancy_grid[row, col] < self.forbidden_cost:
-                    # Inflate (3x3)
                     for dr in [-1, 0, 1]:
                         for dc in [-1, 0, 1]:
                             r, c = row + dr, col + dc
@@ -151,11 +137,9 @@ class OccupancyGridNavigator(Node):
                                     )
 
     def find_path_astar(self, start_pos, goal_pos):
-        """A* pathfinding"""
         start_row, start_col = start_pos
         goal_row, goal_col = goal_pos
         
-        # Check goal validity
         if self.occupancy_grid[goal_row, goal_col] >= self.forbidden_cost:
             return []
         
@@ -192,7 +176,6 @@ class OccupancyGridNavigator(Node):
                     
                     cell_cost = self.occupancy_grid[nr, nc]
                     
-                    # Skip forbidden cells
                     if cell_cost >= self.forbidden_cost:
                         continue
                     
@@ -211,7 +194,6 @@ class OccupancyGridNavigator(Node):
         return np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
 
     def reconstruct_path(self, came_from, current):
-        """Reconstruct and simplify path"""
         path = [current]
         while current in came_from:
             current = came_from[current]
@@ -224,15 +206,14 @@ class OccupancyGridNavigator(Node):
             x, y = self.grid_to_world(row, col)
             world_path.append((x, y))
         
-        # Simplify: every 3rd point
-        simplified = world_path[::3]
+        # Simplify: every 4th point
+        simplified = world_path[::4]
         if len(world_path) > 0 and world_path[-1] not in simplified:
             simplified.append(world_path[-1])
         
         return simplified
 
     def lidar_callback(self, scan_msg):
-        """Process LiDAR"""
         ranges = np.array(scan_msg.ranges)
         ranges[ranges == 0] = float('inf')
         ranges[ranges == float('-inf')] = float('inf')
@@ -263,58 +244,85 @@ class OccupancyGridNavigator(Node):
         left_b, right_b = self.get_lane_boundaries_in_meters()
         path_len = len(self.current_path)
         
+        target_info = ""
+        if path_len > 0:
+            # Find look-ahead point
+            target = self.find_lookahead_point()
+            if target:
+                tx, ty = target
+                dist = np.sqrt(tx**2 + ty**2)
+                target_info = f"Target: ({tx:.2f}, {ty:.2f}) @ {dist:.2f}m"
+        
         self.get_logger().info(
             f'Lanes: L={left_b:.2f}m R={right_b:.2f}m | '
-            f'Path: {path_len} waypoints | '
-            f'Waypoint: {self.path_waypoint_index}/{path_len}'
+            f'Path: {path_len} pts | {target_info}'
         )
+
+    def find_lookahead_point(self):
+        """Find point on path at look_ahead_distance from robot"""
+        if len(self.current_path) == 0:
+            return None
+        
+        # Find closest point on path ahead of robot
+        best_point = None
+        best_dist_diff = float('inf')
+        
+        for point in self.current_path:
+            x, y = point
+            dist = np.sqrt(x**2 + y**2)
+            
+            # Skip points behind robot
+            if x < 0.05:
+                continue
+            
+            # Find point closest to look_ahead_distance
+            dist_diff = abs(dist - self.look_ahead_distance)
+            if dist_diff < best_dist_diff:
+                best_dist_diff = dist_diff
+                best_point = point
+        
+        # If no point found at look_ahead, use last point
+        if best_point is None and len(self.current_path) > 0:
+            best_point = self.current_path[-1]
+        
+        return best_point
 
     def control_loop(self):
         """Main loop: Always plan, always follow"""
         
-        # Step 1: Plan path from current position to goal
-        start_grid = self.world_to_grid(0.05, 0.0)  # Just ahead
-        goal_grid = self.world_to_grid(self.grid_length - 0.2, 0.0)  # Far ahead, centered
+        # Plan path
+        start_grid = self.world_to_grid(0.05, 0.0)
+        goal_grid = self.world_to_grid(self.grid_length - 0.2, 0.0)
         
         if start_grid is None or goal_grid is None:
             self.stop()
             return
         
-        # Step 2: Run A* 
+        # Run A*
         path = self.find_path_astar(start_grid, goal_grid)
         
         if len(path) == 0:
-            # No path found -> STOP (blocked by forbidden zones or obstacles)
             self.get_logger().warn('[GRID] No path! STOPPING.', throttle_duration_sec=1.0)
             self.stop()
             return
         
-        # Step 3: Update current path
+        # Update path
         self.current_path = path
-        self.path_waypoint_index = 0  # Always start from first waypoint
         
-        # Step 4: Follow path
+        # Follow path using look-ahead
         self.follow_path()
 
     def follow_path(self):
-        """Follow the planned path"""
-        if self.path_waypoint_index >= len(self.current_path):
-            # Shouldn't happen since we replan every cycle
+        """Follow path using pure pursuit with look-ahead"""
+        
+        # Find look-ahead target point
+        target = self.find_lookahead_point()
+        
+        if target is None:
             self.stop()
             return
         
-        # Get target waypoint
-        target_x, target_y = self.current_path[self.path_waypoint_index]
-        
-        # Check if waypoint reached
-        dist_to_waypoint = np.sqrt(target_x**2 + target_y**2)
-        if dist_to_waypoint < self.waypoint_reached_threshold:
-            # Move to next waypoint
-            self.path_waypoint_index += 1
-            if self.path_waypoint_index >= len(self.current_path):
-                # Path completed, but we'll replan next cycle anyway
-                pass
-            return
+        target_x, target_y = target
         
         # Pure pursuit control
         twist = Twist()
@@ -326,7 +334,7 @@ class OccupancyGridNavigator(Node):
         
         self.pub_cmd.publish(twist)
         
-        # Publish avoid active (always true when following path)
+        # Always active when following path
         avoid_active = Bool()
         avoid_active.data = True
         self.pub_avoid_active.publish(avoid_active)
@@ -337,7 +345,6 @@ class OccupancyGridNavigator(Node):
         self.pub_max_vel.publish(max_vel)
 
     def stop(self):
-        """Emergency stop"""
         self.pub_cmd.publish(Twist())
         avoid_active = Bool()
         avoid_active.data = True
