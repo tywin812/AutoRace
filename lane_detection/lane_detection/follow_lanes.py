@@ -11,24 +11,20 @@ class ControlLane(Node):
     def __init__(self):
         super().__init__('control_lane')
 
-        self.sub_lane = self.create_subscription(
+        self.sub_lane_error = self.create_subscription(
             Float64,
-            '/lane',
+            '/lane_error',
             self.callback_follow_lane,
             1
         )
-        self.sub_max_vel = self.create_subscription(
-            Float64,
-            '/control/max_vel',
-            self.callback_get_max_vel,
-            1
-        )
+
         self.sub_avoid_cmd = self.create_subscription(
             Twist,
             '/avoid_control',
             self.callback_avoid_cmd,
             1
         )
+
         self.sub_avoid_active = self.create_subscription(
             Bool,
             '/avoid_active',
@@ -43,36 +39,37 @@ class ControlLane(Node):
         )
 
         self.last_error = 0
-        self.MAX_VEL = 0.1
+        self.integral_error = 0
+
+        self.base_speed = 0.6
+        self.first_callback = True 
 
         self.avoid_active = False
         self.avoid_twist = Twist()
 
-    def callback_get_max_vel(self, max_vel_msg):
-        self.MAX_VEL = max_vel_msg.data
-
-    def callback_follow_lane(self, desired_center):
-        """
-        Receive lane center data to generate lane following control commands.
-
-        If avoidance mode is enabled, lane following control is ignored.
-        """
+    def callback_follow_lane(self, msg):
         if self.avoid_active:
             return
 
-        center = desired_center.data
-        error = center - 500
+        error = msg.data
 
-        Kp = 0.0025
-        Kd = 0.007
+        Kp = 1.5 #1.4
+        Kd = 0.8 #0.6
 
-        angular_z = Kp * error + Kd * (error - self.last_error)
+        if self.first_callback:
+            angular_z = Kp * error
+            self.first_callback = False
+        else:
+            angular_z = Kp * error + Kd * (error - self.last_error)
+
         self.last_error = error
 
+        speed_factor = max(1 - abs(error), 0) ** 1.5
+        
         twist = Twist()
-        # Linear velocity: adjust speed based on error (maximum 0.05 limit)
-        twist.linear.x = min(self.MAX_VEL * (max(1 - abs(error) / 500, 0) ** 2.2), 0.05)
-        twist.angular.z = -max(angular_z, -2.0) if angular_z < 0 else -min(angular_z, 2.0)
+
+        twist.linear.x = min(max(self.base_speed * speed_factor, -0.85), 0.85)
+        twist.angular.z = -max(min(angular_z, 1.0), -1.0)
         self.pub_cmd_vel.publish(twist)
 
     def callback_avoid_cmd(self, twist_msg):
