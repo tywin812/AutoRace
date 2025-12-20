@@ -10,10 +10,7 @@ import numpy as np
 class OccupancyGridNavigator(Node):
     """Ultra-Pure Occupancy Grid Navigation
     
-    Simplest possible approach:
-    1. Build occupancy grid from LiDAR + lane boundaries
-    2. Plan path with A* every cycle
-    3. Follow the path
+    Grid -> Plan -> Follow
     """
 
     def __init__(self):
@@ -31,15 +28,15 @@ class OccupancyGridNavigator(Node):
         self.pub_max_vel = self.create_publisher(Float64, '/control/max_vel', 10)
 
         # State
-        self.left_distance = 999.0  # pixels
-        self.right_distance = 999.0  # pixels
+        self.left_distance = 999.0
+        self.right_distance = 999.0
         self.lane_state = 0
-        self.current_path = []  # Current planned path
+        self.current_path = []
         
         # Grid parameters
-        self.grid_resolution = 0.05  # 5cm per cell
-        self.grid_width = 2.0  # 2m total width
-        self.grid_length = 2.0  # 2m look ahead
+        self.grid_resolution = 0.05
+        self.grid_width = 2.0
+        self.grid_length = 2.0
         self.grid_w = int(self.grid_width / self.grid_resolution)
         self.grid_h = int(self.grid_length / self.grid_resolution)
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
@@ -48,23 +45,23 @@ class OccupancyGridNavigator(Node):
         self.lane_width_pixels = 600.0
         self.lane_width_meters = 0.6
         self.pixels_per_meter = self.lane_width_pixels / self.lane_width_meters
-        self.lane_boundary_margin = 0.08  # meters
+        self.lane_boundary_margin = 0.08
         
         # Grid costs
-        self.forbidden_cost = 1000.0  # Behind lane lines
-        self.obstacle_cost = 100.0    # Obstacles
+        self.forbidden_cost = 1000.0
+        self.obstacle_cost = 100.0
         
         # Control parameters
         self.speed = 0.18
         self.steering_gain = 3.0
-        self.look_ahead_distance = 0.4  # Look this far ahead on path
+        self.look_ahead_distance = 0.4
         
         # Control timer
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.status_timer = self.create_timer(1.0, self.log_status)
+        self.status_timer = self.create_timer(0.5, self.log_status)  # More frequent
 
-        self.get_logger().info('=== Ultra-Pure Occupancy Grid Navigator ===')
-        self.get_logger().info(f'Grid: {self.grid_w}x{self.grid_h} @ {self.grid_resolution}m')
+        self.get_logger().info('=== Grid Navigator ===' )
+        self.get_logger().info(f'Publishing to: /avoid_control, /avoid_active')
 
     def pixels_to_meters(self, pixel_distance):
         return pixel_distance / self.pixels_per_meter
@@ -102,10 +99,8 @@ class OccupancyGridNavigator(Node):
         return (x, y)
 
     def build_occupancy_grid(self, lidar_points):
-        # Reset
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         
-        # Mark forbidden zones
         left_boundary, right_boundary = self.get_lane_boundaries_in_meters()
         
         if self.lane_state > 0:
@@ -118,7 +113,6 @@ class OccupancyGridNavigator(Node):
                     elif right_boundary > -999.0 and y < right_boundary:
                         self.occupancy_grid[row, col] = self.forbidden_cost
         
-        # Mark obstacles
         for point in lidar_points:
             x, y = point[0], point[1]
             grid_pos = self.world_to_grid(x, y)
@@ -200,13 +194,11 @@ class OccupancyGridNavigator(Node):
             path.append(current)
         path.reverse()
         
-        # Convert to world coords
         world_path = []
         for row, col in path:
             x, y = self.grid_to_world(row, col)
             world_path.append((x, y))
         
-        # Simplify: every 4th point
         simplified = world_path[::4]
         if len(world_path) > 0 and world_path[-1] not in simplified:
             simplified.append(world_path[-1])
@@ -246,24 +238,22 @@ class OccupancyGridNavigator(Node):
         
         target_info = ""
         if path_len > 0:
-            # Find look-ahead point
             target = self.find_lookahead_point()
             if target:
                 tx, ty = target
                 dist = np.sqrt(tx**2 + ty**2)
-                target_info = f"Target: ({tx:.2f}, {ty:.2f}) @ {dist:.2f}m"
+                angle = np.arctan2(ty, tx) * 180 / np.pi
+                angular_z = self.steering_gain * np.arctan2(ty, tx)
+                target_info = f"Target: ({tx:.2f},{ty:.2f}) {dist:.2f}m {angle:.0f}° -> ω={angular_z:.2f}"
         
         self.get_logger().info(
-            f'Lanes: L={left_b:.2f}m R={right_b:.2f}m | '
-            f'Path: {path_len} pts | {target_info}'
+            f'L={left_b:.2f} R={right_b:.2f} | Path={path_len} | {target_info}'
         )
 
     def find_lookahead_point(self):
-        """Find point on path at look_ahead_distance from robot"""
         if len(self.current_path) == 0:
             return None
         
-        # Find closest point on path ahead of robot
         best_point = None
         best_dist_diff = float('inf')
         
@@ -271,26 +261,20 @@ class OccupancyGridNavigator(Node):
             x, y = point
             dist = np.sqrt(x**2 + y**2)
             
-            # Skip points behind robot
             if x < 0.05:
                 continue
             
-            # Find point closest to look_ahead_distance
             dist_diff = abs(dist - self.look_ahead_distance)
             if dist_diff < best_dist_diff:
                 best_dist_diff = dist_diff
                 best_point = point
         
-        # If no point found at look_ahead, use last point
         if best_point is None and len(self.current_path) > 0:
             best_point = self.current_path[-1]
         
         return best_point
 
     def control_loop(self):
-        """Main loop: Always plan, always follow"""
-        
-        # Plan path
         start_grid = self.world_to_grid(0.05, 0.0)
         goal_grid = self.world_to_grid(self.grid_length - 0.2, 0.0)
         
@@ -298,24 +282,17 @@ class OccupancyGridNavigator(Node):
             self.stop()
             return
         
-        # Run A*
         path = self.find_path_astar(start_grid, goal_grid)
         
         if len(path) == 0:
-            self.get_logger().warn('[GRID] No path! STOPPING.', throttle_duration_sec=1.0)
+            self.get_logger().warn('[NO PATH]', throttle_duration_sec=1.0)
             self.stop()
             return
         
-        # Update path
         self.current_path = path
-        
-        # Follow path using look-ahead
         self.follow_path()
 
     def follow_path(self):
-        """Follow path using pure pursuit with look-ahead"""
-        
-        # Find look-ahead target point
         target = self.find_lookahead_point()
         
         if target is None:
@@ -324,22 +301,29 @@ class OccupancyGridNavigator(Node):
         
         target_x, target_y = target
         
-        # Pure pursuit control
+        # Calculate control
         twist = Twist()
         twist.linear.x = self.speed
-        
         angle_to_target = np.arctan2(target_y, target_x)
         twist.angular.z = self.steering_gain * angle_to_target
         twist.angular.z = np.clip(twist.angular.z, -1.5, 1.5)
         
+        # Publish
         self.pub_cmd.publish(twist)
         
-        # Always active when following path
+        # Debug log (throttled)
+        self.get_logger().debug(
+            f'CMD: v={twist.linear.x:.2f} ω={twist.angular.z:.2f} | '
+            f'Target: ({target_x:.2f},{target_y:.2f})',
+            throttle_duration_sec=0.5
+        )
+        
+        # Always active
         avoid_active = Bool()
         avoid_active.data = True
         self.pub_avoid_active.publish(avoid_active)
         
-        # Publish speed
+        # Speed
         max_vel = Float64()
         max_vel.data = self.speed
         self.pub_max_vel.publish(max_vel)
