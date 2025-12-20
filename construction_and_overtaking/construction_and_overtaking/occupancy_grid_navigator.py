@@ -88,6 +88,8 @@ class OccupancyGridNavigator(Node):
         self.rotation_speed = 0.25  # rad/s - REDUCED from 0.5 for smoother rotation
         self.no_path_start_time = None  # Track how long we've been stuck
         self.max_rotation_time = 4.0  # Increased from 3.0s since we rotate slower
+        self.was_rotating = False  # Track if we were just rotating
+        self.brake_cycles = 0  # Counter for braking duration
         
         # Control timer
         self.timer = self.create_timer(0.1, self.control_loop)
@@ -593,6 +595,9 @@ class OccupancyGridNavigator(Node):
             
             self.current_rotation_dir = rotation_dir * self.rotation_speed
         
+        # Mark that we are rotating
+        self.was_rotating = True
+        
         # Check if we should switch direction
         elapsed = current_time - self.no_path_start_time
         if elapsed > self.max_rotation_time:
@@ -626,9 +631,19 @@ class OccupancyGridNavigator(Node):
         )
 
     def control_loop(self):
+        # Handle braking after rotation
+        if self.brake_cycles > 0:
+            # Publish stop command
+            twist = Twist()  # All zeros
+            self.pub_cmd.publish(twist)
+            self.brake_cycles -= 1
+            self.get_logger().info(f'[BRAKE] Stopping rotation... ({self.brake_cycles} cycles left)', throttle_duration_sec=0.2)
+            return
+        
         if not self.check_obstacles():
             # Reset rotation state when clear
             self.no_path_start_time = None
+            self.was_rotating = False
             
             avoid_active = Bool()
             avoid_active.data = False
@@ -719,14 +734,27 @@ class OccupancyGridNavigator(Node):
             self.rotate_to_find_path()  # Smart rotation instead of stop
             return
         
-        # Path found! Reset rotation state and STOP rotating immediately
-        if self.no_path_start_time is not None:
-            self.get_logger().info('[PATH FOUND] Stopping rotation, executing path!', throttle_duration_sec=0.5)
+        # Path found! Apply brakes if we were rotating
+        if self.was_rotating:
+            self.get_logger().info('[PATH FOUND] BRAKING! Stopping rotation...', throttle_duration_sec=0.5)
+            # Send stop command immediately
+            twist = Twist()
+            self.pub_cmd.publish(twist)
+            # Set brake cycles (2-3 cycles = 0.2-0.3s braking)
+            self.brake_cycles = 2
+            self.was_rotating = False
+        
+        # Reset rotation state
         self.no_path_start_time = None
         
         self.current_path = path
         if hasattr(self, 'last_frame_id'):
             self.publish_debug_path(path, self.last_frame_id)
+        
+        # Don't follow path yet if braking
+        if self.brake_cycles > 0:
+            return
+        
         self.follow_path()
 
     def publish_debug_path(self, path, frame_id):
