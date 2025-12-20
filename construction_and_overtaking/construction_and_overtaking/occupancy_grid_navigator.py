@@ -85,9 +85,9 @@ class OccupancyGridNavigator(Node):
         
         # Smart rotation parameters
         self.last_turn_direction = 0.0  # Positive = left, Negative = right
-        self.rotation_speed = 0.2  # rad/s - REDUCED AGAIN for precision
+        self.rotation_speed = 0.1  # rad/s - VERY SLOW for precision (was 0.2)
         self.no_path_start_time = None  # Track how long we've been stuck
-        self.max_rotation_time = 5.0  # Increased since slower rotation
+        self.max_rotation_time = 10.0  # Doubled since rotation is 2x slower
         self.rotating_mode = False  # Are we in rotation mode?
         
         # Debug
@@ -101,7 +101,7 @@ class OccupancyGridNavigator(Node):
         self.get_logger().info('=== Grid Navigator with Reactive Rotation ===' )
         self.get_logger().info(f'Min passage width: {self.min_passage_width}m ({int(self.min_passage_width/self.grid_resolution)} cells)')
         self.get_logger().info(f'White line validation: min_width={self.min_lane_width_px}px, max_jump={self.max_jump_threshold_px}px')
-        self.get_logger().info(f'Rotation: {self.rotation_speed} rad/s (ultra-precise), max time: {self.max_rotation_time}s')
+        self.get_logger().info(f'Rotation: {self.rotation_speed} rad/s (~6°/s VERY SLOW), max time: {self.max_rotation_time}s')
         self.get_logger().info(f'Publishing to: /avoid_control, /avoid_active')
 
     def pixels_to_meters(self, pixel_distance):
