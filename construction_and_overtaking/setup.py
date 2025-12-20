@@ -24,7 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'obstacle_avoidance = construction_and_overtaking.obstacle_avoidance:main',
-            'occupancy_grid_navigator = construction_and_overtaking.occupancy_grid_navigator:main'
+            'occupancy_grid_navigator = construction_and_overtaking.occupancy_grid_navigator:main',
         ],
     },
 )
