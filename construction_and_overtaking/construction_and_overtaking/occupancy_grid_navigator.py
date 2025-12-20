@@ -66,6 +66,13 @@ class OccupancyGridNavigator(Node):
         self.pixels_per_meter = self.lane_width_pixels / self.lane_width_meters
         self.lane_boundary_margin = 0.08
         
+        # White line validation parameters
+        self.min_lane_width_px = 400.0  # Minimum expected lane width (53cm)
+        self.right_distance_history = []  # History for stability check
+        self.history_length = 10  # 1 second at 10Hz
+        self.max_jump_threshold_px = 150.0  # Maximum allowed sudden change
+        self.white_line_valid = True  # Flag for current white line validity
+        
         # Grid costs
         self.forbidden_cost = 1000.0  # Lane boundaries
         self.obstacle_cost = 100.0    # Physical obstacles
@@ -81,21 +88,72 @@ class OccupancyGridNavigator(Node):
 
         self.get_logger().info('=== Grid Navigator with Width Validation ===' )
         self.get_logger().info(f'Min passage width: {self.min_passage_width}m ({int(self.min_passage_width/self.grid_resolution)} cells)')
+        self.get_logger().info(f'White line validation: min_width={self.min_lane_width_px}px, max_jump={self.max_jump_threshold_px}px')
         self.get_logger().info(f'Publishing to: /avoid_control, /avoid_active')
 
     def pixels_to_meters(self, pixel_distance):
         return pixel_distance / self.pixels_per_meter
 
+    def validate_white_line(self):
+        """
+        Validates white line detection using two methods:
+        1. Width check: Yellow line priority - reject if road too narrow
+        2. Stability check: Reject sudden jumps (likely cones)
+        
+        Returns:
+            bool: True if white line is trustworthy
+        """
+        if self.right_distance >= 999.0:
+            return True  # No white line detected, nothing to validate
+        
+        # Check 1: Width validation (Yellow line priority)
+        if self.left_distance < 999.0:
+            current_width_px = self.left_distance + self.right_distance
+            
+            if current_width_px < self.min_lane_width_px:
+                self.get_logger().warn(
+                    f'[VALIDATE] Road too narrow! W={current_width_px:.0f}px < {self.min_lane_width_px:.0f}px. '
+                    f'White line likely a CONE - ignoring.',
+                    throttle_duration_sec=1.0
+                )
+                return False
+        
+        # Check 2: Stability validation
+        if len(self.right_distance_history) >= 5:
+            stable_distance = np.median(self.right_distance_history)
+            
+            if stable_distance < 999.0:
+                change = abs(self.right_distance - stable_distance)
+                
+                if change > self.max_jump_threshold_px:
+                    self.get_logger().warn(
+                        f'[VALIDATE] Sudden jump! {stable_distance:.0f} -> {self.right_distance:.0f}px '
+                        f'(Δ={change:.0f}px). Likely CONE - ignoring.',
+                        throttle_duration_sec=1.0
+                    )
+                    return False
+        
+        return True  # All checks passed
+
     def get_lane_boundaries_in_meters(self):
+        """
+        Calculate lane boundaries with smart white line validation.
+        """
+        left_boundary = 999.0
+        right_boundary = -999.0
+        
+        # Yellow line (left) - always trusted
         if self.left_distance < 999.0:
             left_boundary = self.pixels_to_meters(self.left_distance) + self.lane_boundary_margin
-        else:
-            left_boundary = 999.0
-            
+        
+        # White line (right) - validated
         if self.right_distance < 999.0:
-            right_boundary = -(self.pixels_to_meters(self.right_distance) + self.lane_boundary_margin)
-        else:
-            right_boundary = -999.0
+            if self.white_line_valid:
+                right_boundary = -(self.pixels_to_meters(self.right_distance) + self.lane_boundary_margin)
+            else:
+                # White line rejected - ignore it
+                right_boundary = -999.0
+                self.get_logger().debug('[LANE] Using yellow line only (white rejected)', throttle_duration_sec=2.0)
             
         return left_boundary, right_boundary
 
@@ -161,6 +219,9 @@ class OccupancyGridNavigator(Node):
     def build_occupancy_grid(self, lidar_points, stamp, frame_id):
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         
+        # Get validated boundaries
+        left_boundary, right_boundary = self.get_lane_boundaries_in_meters()
+        
         # Draw lanes from paths (Curved)
         for path_points in [self.left_lane_path, self.right_lane_path]:
             for point in path_points:
@@ -178,8 +239,7 @@ class OccupancyGridNavigator(Node):
                                 self.occupancy_grid[r, c] = self.forbidden_cost
 
         # Fallback: Draw straight lines if paths are empty but we have distances
-        if not self.left_lane_path and self.left_distance < 999.0:
-             left_boundary = self.pixels_to_meters(self.left_distance) + self.lane_boundary_margin
+        if not self.left_lane_path and left_boundary < 999.0:
              for row in range(self.grid_h):
                 x, y_dummy = self.grid_to_world(row, 0)
                 if x > 1.0: continue
@@ -188,8 +248,7 @@ class OccupancyGridNavigator(Node):
                     if y > left_boundary:
                         self.occupancy_grid[row, col] = self.forbidden_cost
 
-        if not self.right_lane_path and self.right_distance < 999.0:
-             right_boundary = -(self.pixels_to_meters(self.right_distance) + self.lane_boundary_margin)
+        if not self.right_lane_path and right_boundary > -999.0:
              for row in range(self.grid_h):
                 x, y_dummy = self.grid_to_world(row, 0)
                 if x > 1.0: continue
@@ -252,7 +311,7 @@ class OccupancyGridNavigator(Node):
         if self.occupancy_grid[goal_row, goal_col] >= self.forbidden_cost:
             return []
         
-        # NEW: Check if goal is in wide enough passage
+        # Check if goal is in wide enough passage
         if not self.is_passage_wide_enough(goal_pos):
             self.get_logger().warn(
                 f'[A*] Goal at ({goal_row},{goal_col}) is in narrow passage!',
@@ -297,7 +356,7 @@ class OccupancyGridNavigator(Node):
                     if cell_cost >= self.forbidden_cost:
                         continue
                     
-                    # NEW: Check passage width before adding to open set
+                    # Check passage width before adding to open set
                     if not self.is_passage_wide_enough(neighbor):
                         continue  # Skip narrow passages
                     
@@ -347,7 +406,7 @@ class OccupancyGridNavigator(Node):
         )
         
         if len(angles) > len(ranges):
-            angles = angles[:len(ranges)]
+            angles = angles[:len(ranges)]]
         elif len(angles) < len(ranges):
              angles = np.pad(angles, (0, len(ranges) - len(angles)), 'edge')
 
@@ -382,7 +441,19 @@ class OccupancyGridNavigator(Node):
         self.left_distance = 999.0 if msg.data < 0 else msg.data
 
     def right_distance_callback(self, msg):
-        self.right_distance = 999.0 if msg.data < 0 else msg.data
+        """Right lane distance with stability tracking."""
+        new_distance = 999.0 if msg.data < 0 else msg.data
+        
+        # Add to history
+        self.right_distance_history.append(new_distance)
+        if len(self.right_distance_history) > self.history_length:
+            self.right_distance_history.pop(0)
+        
+        # Update raw distance
+        self.right_distance = new_distance
+        
+        # Validate white line
+        self.white_line_valid = self.validate_white_line()
 
     def lane_state_callback(self, msg):
         self.lane_state = msg.data
@@ -390,6 +461,10 @@ class OccupancyGridNavigator(Node):
     def log_status(self):
         left_b, right_b = self.get_lane_boundaries_in_meters()
         path_len = len(self.current_path)
+        
+        # Show validation status
+        white_status = "✓" if self.white_line_valid else "✗"
+        width_px = self.left_distance + self.right_distance if (self.left_distance < 999.0 and self.right_distance < 999.0) else 0
         
         target_info = ""
         if path_len > 0:
@@ -401,7 +476,7 @@ class OccupancyGridNavigator(Node):
                 target_info = f"-> ({tx:.2f},{ty:.2f}) {dist:.2f}m {angle:.0f}°"
         
         self.get_logger().info(
-            f'L={left_b:.2f} R={right_b:.2f} | Path={path_len} {target_info}'
+            f'L={left_b:.2f} R={right_b:.2f} {white_status} W={width_px:.0f}px | Path={path_len} {target_info}'
         )
 
     def find_lookahead_point(self):
@@ -481,7 +556,7 @@ class OccupancyGridNavigator(Node):
                 if self.occupancy_grid[row, col] < self.obstacle_cost:
                     free_cols.append(col)
             
-            # NEW: Require minimum width
+            # Require minimum width
             if len(free_cols) < min_width_cells:
                 continue
             
@@ -495,7 +570,7 @@ class OccupancyGridNavigator(Node):
                 if free_cols[i] == free_cols[i-1] + 1:
                     current_segment.append(free_cols[i])
                 else:
-                    # NEW: Only save wide segments
+                    # Only save wide segments
                     if len(current_segment) >= min_width_cells:
                         segments.append(current_segment)
                     current_segment = [free_cols[i]]
@@ -512,7 +587,7 @@ class OccupancyGridNavigator(Node):
             goal_col = best_segment[len(best_segment)//2]
             goal_grid = (row, goal_col)
             
-            # NEW: Double-check with validation function
+            # Double-check with validation function
             if self.is_passage_wide_enough(goal_grid):
                 self.get_logger().debug(
                     f'[GOAL] Found at row {row}, width={len(best_segment)} cells '
