@@ -85,20 +85,19 @@ class OccupancyGridNavigator(Node):
         
         # Smart rotation parameters
         self.last_turn_direction = 0.0  # Positive = left, Negative = right
-        self.rotation_speed = 0.25  # rad/s - REDUCED from 0.5 for smoother rotation
+        self.rotation_speed = 0.2  # rad/s - REDUCED AGAIN for precision
         self.no_path_start_time = None  # Track how long we've been stuck
-        self.max_rotation_time = 4.0  # Increased from 3.0s since we rotate slower
-        self.was_rotating = False  # Track if we were just rotating
-        self.brake_cycles = 0  # Counter for braking duration
+        self.max_rotation_time = 5.0  # Increased since slower rotation
+        self.rotating_mode = False  # Are we in rotation mode?
         
         # Control timer
         self.timer = self.create_timer(0.1, self.control_loop)
         self.status_timer = self.create_timer(0.5, self.log_status)
 
-        self.get_logger().info('=== Grid Navigator with Smart Rotation ===' )
+        self.get_logger().info('=== Grid Navigator with Reactive Rotation ===' )
         self.get_logger().info(f'Min passage width: {self.min_passage_width}m ({int(self.min_passage_width/self.grid_resolution)} cells)')
         self.get_logger().info(f'White line validation: min_width={self.min_lane_width_px}px, max_jump={self.max_jump_threshold_px}px')
-        self.get_logger().info(f'Rotation: {self.rotation_speed} rad/s (slow & precise), max time: {self.max_rotation_time}s')
+        self.get_logger().info(f'Rotation: {self.rotation_speed} rad/s (ultra-precise), max time: {self.max_rotation_time}s')
         self.get_logger().info(f'Publishing to: /avoid_control, /avoid_active')
 
     def pixels_to_meters(self, pixel_distance):
@@ -258,6 +257,74 @@ class OccupancyGridNavigator(Node):
         else:
             return -self.rotation_speed  # Turn right (negative)
 
+    def try_find_path(self):
+        """
+        Try to find a valid path. Returns path if found, empty list otherwise.
+        This is called both during normal operation AND during rotation.
+        """
+        goal_grid = None
+        min_width_cells = int(self.min_passage_width / self.grid_resolution)
+        
+        start_scan_row = int(1.5 / self.grid_resolution)
+        end_scan_row = int(0.5 / self.grid_resolution)
+        
+        for row in range(start_scan_row, end_scan_row, -1):
+            if row >= self.grid_h:
+                continue
+            
+            # Get free cells in this row
+            free_cols = []
+            for col in range(self.grid_w):
+                if self.occupancy_grid[row, col] < self.obstacle_cost:
+                    free_cols.append(col)
+            
+            # Require minimum width
+            if len(free_cols) < min_width_cells:
+                continue
+            
+            # Find contiguous segments
+            segments = []
+            if not free_cols:
+                continue
+                
+            current_segment = [free_cols[0]]
+            for i in range(1, len(free_cols)):
+                if free_cols[i] == free_cols[i-1] + 1:
+                    current_segment.append(free_cols[i])
+                else:
+                    # Only save wide segments
+                    if len(current_segment) >= min_width_cells:
+                        segments.append(current_segment)
+                    current_segment = [free_cols[i]]
+            
+            # Check last segment
+            if len(current_segment) >= min_width_cells:
+                segments.append(current_segment)
+            
+            if not segments:
+                continue
+            
+            # Pick the widest segment
+            best_segment = max(segments, key=len)
+            goal_col = best_segment[len(best_segment)//2]
+            goal_grid = (row, goal_col)
+            
+            # Double-check with validation function
+            if self.is_passage_wide_enough(goal_grid):
+                break
+            else:
+                goal_grid = None  # Reset and try next row
+        
+        if goal_grid is None:
+            goal_grid = self.world_to_grid(0.5, 0.0)
+        
+        start_grid = self.world_to_grid(0.05, 0.0)
+        
+        if start_grid is None or goal_grid is None:
+            return []
+        
+        return self.find_path_astar(start_grid, goal_grid)
+
     def build_occupancy_grid(self, lidar_points, stamp, frame_id):
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         
@@ -355,10 +422,6 @@ class OccupancyGridNavigator(Node):
         
         # Check if goal is in wide enough passage
         if not self.is_passage_wide_enough(goal_pos):
-            self.get_logger().warn(
-                f'[A*] Goal at ({goal_row},{goal_col}) is in narrow passage!',
-                throttle_duration_sec=1.0
-            )
             return []
         
         open_set = [(0, start_pos)]
@@ -517,8 +580,9 @@ class OccupancyGridNavigator(Node):
                 angle = np.arctan2(ty, tx) * 180 / np.pi
                 target_info = f"-> ({tx:.2f},{ty:.2f}) {dist:.2f}m {angle:.0f}°"
         
+        mode = "ROTATE" if self.rotating_mode else "NORMAL"
         self.get_logger().info(
-            f'L={left_b:.2f} R={right_b:.2f} {white_status} W={width_px:.0f}px | Path={path_len} {target_info}'
+            f'[{mode}] L={left_b:.2f} R={right_b:.2f} {white_status} | Path={path_len} {target_info}'
         )
 
     def find_lookahead_point(self):
@@ -566,84 +630,11 @@ class OccupancyGridNavigator(Node):
         roi = self.occupancy_grid[start_row:end_row, start_col:end_col]
         return np.any(roi == self.obstacle_cost)
 
-    def rotate_to_find_path(self):
-        """
-        Rotate in place to search for a viable path.
-        Uses last turn direction or analyzes grid to choose direction.
-        """
-        current_time = time.time()
-        
-        # Initialize rotation if just starting
-        if self.no_path_start_time is None:
-            self.no_path_start_time = current_time
-            
-            # Determine rotation direction
-            if abs(self.last_turn_direction) > 0.01:
-                # Use last successful turn direction
-                rotation_dir = np.sign(self.last_turn_direction)
-                self.get_logger().info(
-                    f'[ROTATE] Using last turn direction: {"LEFT" if rotation_dir > 0 else "RIGHT"}',
-                    throttle_duration_sec=1.0
-                )
-            else:
-                # Analyze grid to choose direction
-                rotation_dir = np.sign(self.analyze_grid_for_rotation_direction())
-                self.get_logger().info(
-                    f'[ROTATE] Analyzing grid, choosing: {"LEFT" if rotation_dir > 0 else "RIGHT"}',
-                    throttle_duration_sec=1.0
-                )
-            
-            self.current_rotation_dir = rotation_dir * self.rotation_speed
-        
-        # Mark that we are rotating
-        self.was_rotating = True
-        
-        # Check if we should switch direction
-        elapsed = current_time - self.no_path_start_time
-        if elapsed > self.max_rotation_time:
-            # Switch direction
-            self.current_rotation_dir = -self.current_rotation_dir
-            self.no_path_start_time = current_time
-            self.get_logger().warn(
-                f'[ROTATE] Switching direction after {self.max_rotation_time}s',
-                throttle_duration_sec=1.0
-            )
-        
-        # Execute rotation
-        twist = Twist()
-        twist.linear.x = 0.0  # No forward movement
-        twist.angular.z = self.current_rotation_dir
-        self.pub_cmd.publish(twist)
-        
-        # Stay active
-        avoid_active = Bool()
-        avoid_active.data = True
-        self.pub_avoid_active.publish(avoid_active)
-        
-        max_vel = Float64()
-        max_vel.data = 0.0
-        self.pub_max_vel.publish(max_vel)
-        
-        self.get_logger().info(
-            f'[ROTATE] Spinning {"LEFT" if self.current_rotation_dir > 0 else "RIGHT"} '
-            f'({elapsed:.1f}s)',
-            throttle_duration_sec=0.5
-        )
-
     def control_loop(self):
-        # Handle braking after rotation
-        if self.brake_cycles > 0:
-            # Publish stop command
-            twist = Twist()  # All zeros
-            self.pub_cmd.publish(twist)
-            self.brake_cycles -= 1
-            self.get_logger().info(f'[BRAKE] Stopping rotation... ({self.brake_cycles} cycles left)', throttle_duration_sec=0.2)
-            return
-        
         if not self.check_obstacles():
             # Reset rotation state when clear
             self.no_path_start_time = None
-            self.was_rotating = False
+            self.rotating_mode = False
             
             avoid_active = Bool()
             avoid_active.data = False
@@ -658,102 +649,60 @@ class OccupancyGridNavigator(Node):
                 self.publish_debug_path([], self.last_frame_id)
             return
 
-        # Dynamic Goal Selection with width validation
-        goal_grid = None
-        min_width_cells = int(self.min_passage_width / self.grid_resolution)
-        
-        start_scan_row = int(1.5 / self.grid_resolution)
-        end_scan_row = int(0.5 / self.grid_resolution)
-        
-        for row in range(start_scan_row, end_scan_row, -1):
-            if row >= self.grid_h:
-                continue
-            
-            # Get free cells in this row
-            free_cols = []
-            for col in range(self.grid_w):
-                if self.occupancy_grid[row, col] < self.obstacle_cost:
-                    free_cols.append(col)
-            
-            # Require minimum width
-            if len(free_cols) < min_width_cells:
-                continue
-            
-            # Find contiguous segments
-            segments = []
-            if not free_cols:
-                continue
-                
-            current_segment = [free_cols[0]]
-            for i in range(1, len(free_cols)):
-                if free_cols[i] == free_cols[i-1] + 1:
-                    current_segment.append(free_cols[i])
-                else:
-                    # Only save wide segments
-                    if len(current_segment) >= min_width_cells:
-                        segments.append(current_segment)
-                    current_segment = [free_cols[i]]
-            
-            # Check last segment
-            if len(current_segment) >= min_width_cells:
-                segments.append(current_segment)
-            
-            if not segments:
-                continue
-            
-            # Pick the widest segment
-            best_segment = max(segments, key=len)
-            goal_col = best_segment[len(best_segment)//2]
-            goal_grid = (row, goal_col)
-            
-            # Double-check with validation function
-            if self.is_passage_wide_enough(goal_grid):
-                self.get_logger().debug(
-                    f'[GOAL] Found at row {row}, width={len(best_segment)} cells '
-                    f'({len(best_segment)*self.grid_resolution:.2f}m)',
-                    throttle_duration_sec=1.0
-                )
-                break
-            else:
-                goal_grid = None  # Reset and try next row
-        
-        start_grid = self.world_to_grid(0.05, 0.0)
-        
-        if goal_grid is None:
-            self.get_logger().warn('[NO WIDE PASSAGE] All passages too narrow!', throttle_duration_sec=1.0)
-            goal_grid = self.world_to_grid(0.5, 0.0)
-
-        if start_grid is None or goal_grid is None:
-            self.rotate_to_find_path()  # Smart rotation instead of stop
-            return
-        
-        path = self.find_path_astar(start_grid, goal_grid)
+        # Try to find path (works both in normal and rotation mode)
+        path = self.try_find_path()
         
         if len(path) == 0:
-            self.get_logger().warn('[NO PATH] Rotating to find exit...', throttle_duration_sec=1.0)
-            self.rotate_to_find_path()  # Smart rotation instead of stop
+            # No path - enter/continue rotation mode
+            if not self.rotating_mode:
+                self.get_logger().warn('[NO PATH] Entering rotation mode...', throttle_duration_sec=1.0)
+                self.rotating_mode = True
+                self.no_path_start_time = time.time()
+                
+                # Determine rotation direction
+                if abs(self.last_turn_direction) > 0.01:
+                    rotation_dir = np.sign(self.last_turn_direction)
+                else:
+                    rotation_dir = np.sign(self.analyze_grid_for_rotation_direction())
+                
+                self.current_rotation_dir = rotation_dir * self.rotation_speed
+            
+            # Check if should switch direction
+            elapsed = time.time() - self.no_path_start_time
+            if elapsed > self.max_rotation_time:
+                self.current_rotation_dir = -self.current_rotation_dir
+                self.no_path_start_time = time.time()
+                self.get_logger().warn(
+                    f'[ROTATE] Switching direction',
+                    throttle_duration_sec=1.0
+                )
+            
+            # Execute rotation
+            twist = Twist()
+            twist.linear.x = 0.0
+            twist.angular.z = self.current_rotation_dir
+            self.pub_cmd.publish(twist)
+            
+            avoid_active = Bool()
+            avoid_active.data = True
+            self.pub_avoid_active.publish(avoid_active)
+            
+            max_vel = Float64()
+            max_vel.data = 0.0
+            self.pub_max_vel.publish(max_vel)
+            
             return
         
-        # Path found! Apply brakes if we were rotating
-        if self.was_rotating:
-            self.get_logger().info('[PATH FOUND] BRAKING! Stopping rotation...', throttle_duration_sec=0.5)
-            # Send stop command immediately
-            twist = Twist()
-            self.pub_cmd.publish(twist)
-            # Set brake cycles (2-3 cycles = 0.2-0.3s braking)
-            self.brake_cycles = 2
-            self.was_rotating = False
+        # Path found!
+        if self.rotating_mode:
+            self.get_logger().info('[PATH FOUND] Exiting rotation mode!', throttle_duration_sec=0.5)
         
-        # Reset rotation state
+        self.rotating_mode = False
         self.no_path_start_time = None
-        
         self.current_path = path
+        
         if hasattr(self, 'last_frame_id'):
             self.publish_debug_path(path, self.last_frame_id)
-        
-        # Don't follow path yet if braking
-        if self.brake_cycles > 0:
-            return
         
         self.follow_path()
 
@@ -778,7 +727,7 @@ class OccupancyGridNavigator(Node):
         target = self.find_lookahead_point()
         
         if target is None:
-            self.rotate_to_find_path()  # Smart rotation instead of stop
+            self.pub_cmd.publish(Twist())
             return
         
         target_x, target_y = target
