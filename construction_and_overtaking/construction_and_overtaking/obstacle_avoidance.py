@@ -41,16 +41,16 @@ class ObstacleAvoidance(Node):
         self.right_clear = True
         self.obstacle_type = "NONE"
 
-        self.image_center_x = 500.0
-        self.lane_width_pixels = 600.0
+        self.image_center_x = 320.0  # Assuming 640x480 resolution
+        self.lane_width_pixels = 450.0  # Reduced to make calculated lane wider in meters
         self.lane_width_meters = 0.6
         self.pixels_per_meter = self.lane_width_pixels / self.lane_width_meters
-        self.lane_boundary_margin = 0.05
+        self.lane_boundary_margin = 0.15  # Increased margin
 
-        self.obstacle_threshold = 0.5
+        self.obstacle_threshold = 0.7
         self.clear_threshold = 1.5
         self.lane_margin = 100.0
-        self.corridor_width = 0.3
+        self.corridor_width = 0.5  # Increased from 0.3
         self.max_obstacle_width = 0.6
         self.avoidance_speed = 0.1
         self.avoidance_angular = 0.7

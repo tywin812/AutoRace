@@ -31,9 +31,10 @@ def generate_launch_description():
 
     obstacle_avoidance_node = Node(
         package='construction_and_overtaking',
-        executable='obstacle_avoidance',
+        executable='occupancy_grid_navigator',
         name='obstacle_avoidance',
-        output='screen'
+        output='screen',
+        parameters=[{'use_sim_time': True}]
     )
 
     return LaunchDescription([
