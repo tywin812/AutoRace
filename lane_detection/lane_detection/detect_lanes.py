@@ -470,8 +470,8 @@ class DetectLane(Node):
             msg_desired_center.data = centerx.item(450)
             self.pub_lane.publish(msg_desired_center)
             
-            # Publish distances to lanes
-            image_center = cv_image.shape[1] / 2.0
+            # NEW: Publish distances to lanes
+            image_center = cv_image.shape[1] / 2.0  # Center of image width
             
             left_dist_msg = Float64()
             right_dist_msg = Float64()
@@ -479,12 +479,14 @@ class DetectLane(Node):
             if yellow_fraction > 3000:
                 left_dist_msg.data = image_center - self.left_fitx[450]
             else:
-                left_dist_msg.data = 999.0
+                left_dist_msg.data = 999.0  # Large value if line not detected
                 
             if white_fraction > 3000:
                 right_dist_msg.data = self.right_fitx[450] - image_center
             else:
+                # Fallback: if white line is lost but we have yellow, estimate right line
                 if yellow_fraction > 3000:
+                     # Assume standard lane width (e.g. 600px)
                      estimated_right = self.left_fitx[450] + 600
                      right_dist_msg.data = estimated_right - image_center
                 else:
@@ -493,18 +495,23 @@ class DetectLane(Node):
             self.pub_left_distance.publish(left_dist_msg)
             self.pub_right_distance.publish(right_dist_msg)
             
-            # Publish Paths - DENSER: every 5th point instead of 20th
-            ppm = 750.0
+            # Publish Paths
+            ppm = 750.0 # pixels per meter (approx based on 450px / 0.6m)
             
             if yellow_fraction > 3000:
                 path_msg = Path()
                 path_msg.header.frame_id = "robot/base_link"
                 path_msg.header.stamp = self.get_clock().now().to_msg()
                 
-                # CHANGED: Every 5th point (was 20th)
-                for i in range(0, len(ploty), 5):
+                # Sample points (every 20th point)
+                for i in range(0, len(ploty), 20):
                     y_px = ploty[i]
                     x_px = self.left_fitx[i]
+                    
+                    # Convert to Robot Frame
+                    # Image Y (0 at top) -> Robot X (Forward)
+                    # Image X (0 at left) -> Robot Y (Left)
+                    # Robot is at bottom center
                     
                     x_robot = (cv_image.shape[0] - y_px) / ppm
                     y_robot = (image_center - x_px) / ppm
@@ -522,8 +529,7 @@ class DetectLane(Node):
                 path_msg.header.frame_id = "robot/base_link"
                 path_msg.header.stamp = self.get_clock().now().to_msg()
                 
-                # CHANGED: Every 5th point (was 20th)
-                for i in range(0, len(ploty), 5):
+                for i in range(0, len(ploty), 20):
                     y_px = ploty[i]
                     x_px = self.right_fitx[i]
                     
