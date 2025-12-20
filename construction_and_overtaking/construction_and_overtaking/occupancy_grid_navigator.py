@@ -406,7 +406,7 @@ class OccupancyGridNavigator(Node):
         )
         
         if len(angles) > len(ranges):
-            angles = angles[:len(ranges)]]
+            angles = angles[:len(ranges)]
         elif len(angles) < len(ranges):
              angles = np.pad(angles, (0, len(ranges) - len(angles)), 'edge')
 
