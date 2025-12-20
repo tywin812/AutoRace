@@ -5,23 +5,23 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float64, UInt8, Bool
 from geometry_msgs.msg import Twist
 import numpy as np
-from collections import deque
 
 
 class OccupancyGridNavigator(Node):
-    """Navigation using Occupancy Grid + A* Path Planning
+    """Pure Occupancy Grid Navigation with A* Path Planning
     
-    Key features:
-    - Builds occupancy grid from LiDAR data
-    - Marks cells behind lane lines as forbidden
-    - Uses A* pathfinding to find safe path
-    - Robust against confusing cones with lines
+    Core concept:
+    1. Build occupancy grid from LiDAR (obstacles) and camera (forbidden zones)
+    2. Always plan path through free cells
+    3. If path exists -> follow it
+    4. If no path -> stop
+    
+    No reactive checks, no corridor detection - just grid + planning!
     """
     
-    STATE_NORMAL = 0
-    STATE_PLANNING = 1
-    STATE_FOLLOWING_PATH = 2
-    STATE_RETURNING = 3
+    STATE_LANE_FOLLOWING = 0
+    STATE_PATH_FOLLOWING = 1
+    STATE_RETURNING = 2
 
     def __init__(self):
         super().__init__('occupancy_grid_navigator')
@@ -38,7 +38,7 @@ class OccupancyGridNavigator(Node):
         self.pub_max_vel = self.create_publisher(Float64, '/control/max_vel', 10)
 
         # State variables
-        self.state = self.STATE_NORMAL
+        self.state = self.STATE_LANE_FOLLOWING
         self.left_distance = 999.0  # pixels
         self.right_distance = 999.0  # pixels
         self.lane_state = 0
@@ -47,41 +47,40 @@ class OccupancyGridNavigator(Node):
         
         # Grid parameters
         self.grid_resolution = 0.05  # meters per cell (5cm)
-        self.grid_width = 3.0  # meters (1.5m left + 1.5m right)
-        self.grid_length = 2.5  # meters (look ahead)
+        self.grid_width = 2.0  # meters (1m left + 1m right)
+        self.grid_length = 2.0  # meters (look ahead)
         self.grid_w = int(self.grid_width / self.grid_resolution)  # cells
         self.grid_h = int(self.grid_length / self.grid_resolution)  # cells
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         
         # Lane parameters
-        self.image_center_x = 500.0
         self.lane_width_pixels = 600.0
         self.lane_width_meters = 0.6
         self.pixels_per_meter = self.lane_width_pixels / self.lane_width_meters
-        self.lane_boundary_margin = 0.08  # meters - increased for safety
+        self.lane_boundary_margin = 0.08  # meters
         
-        # Detection thresholds
-        self.obstacle_threshold = 0.45  # meters - trigger planning
-        self.clear_threshold = 1.2  # meters - path is clear
-        self.occupied_threshold = 0.7  # grid cell probability to mark as occupied
-        self.forbidden_cost = 1000.0  # cost for forbidden cells (behind lines) - very high!
-        self.obstacle_cost = 50.0  # cost for obstacle cells
-        self.corridor_width = 0.35  # meters - only obstacles in this corridor matter
+        # Grid costs
+        self.forbidden_cost = 1000.0  # cells behind lane lines - CANNOT pass
+        self.obstacle_cost = 100.0    # cells with obstacles - expensive to pass
+        self.free_cost = 0.0          # free cells
         
         # Control parameters
-        self.avoidance_speed = 0.15
-        self.normal_speed = 0.22
-        self.look_ahead_distance = 0.3  # meters for path following
-        self.path_following_threshold = 0.15  # meters - waypoint reached
-        self.waypoint_angular_gain = 2.5  # proportional gain for steering
+        self.path_following_speed = 0.15
+        self.lane_following_speed = 0.22
+        self.waypoint_threshold = 0.12  # meters - waypoint reached
+        self.steering_gain = 2.5
+        
+        # Planning parameters
+        self.path_check_distance = 0.8  # meters - how far ahead to check
+        self.min_clear_width = 0.25  # meters - minimum width for "clear path"
         
         # Timers
         self.timer = self.create_timer(0.1, self.control_loop)
         self.status_timer = self.create_timer(1.0, self.log_status)
 
-        self.get_logger().info('Occupancy Grid Navigator initialized')
-        self.get_logger().info(f'Grid: {self.grid_w}x{self.grid_h} cells ({self.grid_resolution}m resolution)')
-        self.get_logger().info(f'Corridor width: {self.corridor_width}m')
+        self.get_logger().info('=== Pure Occupancy Grid Navigator ===')
+        self.get_logger().info(f'Grid: {self.grid_w}x{self.grid_h} cells @ {self.grid_resolution}m')
+        self.get_logger().info(f'Area: {self.grid_length}m x {self.grid_width}m')
 
     def pixels_to_meters(self, pixel_distance):
         """Convert pixel distance from camera to meters"""
@@ -90,7 +89,6 @@ class OccupancyGridNavigator(Node):
     def get_lane_boundaries_in_meters(self):
         """Get left and right lane boundaries in robot frame (meters)
         Returns: (left_boundary_y, right_boundary_y)
-        Left boundary is positive Y, right boundary is negative Y
         """
         if self.left_distance < 999.0:
             left_boundary_m = self.pixels_to_meters(self.left_distance) + self.lane_boundary_margin
@@ -105,10 +103,8 @@ class OccupancyGridNavigator(Node):
         return left_boundary_m, right_boundary_m
 
     def world_to_grid(self, x, y):
-        """Convert world coordinates (meters, robot frame) to grid indices
+        """Convert world coordinates (meters) to grid indices
         Robot is at bottom center of grid
-        X: forward (0 to grid_length)
-        Y: lateral (-grid_width/2 to +grid_width/2)
         Returns: (row, col) or None if out of bounds
         """
         if x < 0 or x >= self.grid_length:
@@ -125,94 +121,108 @@ class OccupancyGridNavigator(Node):
         return (row, col)
 
     def grid_to_world(self, row, col):
-        """Convert grid indices to world coordinates (meters, robot frame)
-        Returns: (x, y)
-        """
+        """Convert grid indices to world coordinates"""
         x = (row + 0.5) * self.grid_resolution
         y = (col + 0.5) * self.grid_resolution - self.grid_width/2
         return (x, y)
 
     def build_occupancy_grid(self, lidar_points):
-        """Build occupancy grid from LiDAR points and lane boundaries
+        """Build occupancy grid from LiDAR and lane boundaries
         
-        Args:
-            lidar_points: Nx2 array of (x, y) points in meters
+        Priority:
+        1. Mark forbidden zones (behind lines) - HIGHEST priority
+        2. Mark obstacles from LiDAR
         """
         # Reset grid
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         
-        # FIRST: Mark forbidden zones (behind lane lines) with VERY high cost
+        # Step 1: Mark forbidden zones (behind lane lines)
         left_boundary, right_boundary = self.get_lane_boundaries_in_meters()
         
-        if self.lane_state > 0:  # Lane lines detected
+        if self.lane_state > 0:
             for row in range(self.grid_h):
                 for col in range(self.grid_w):
                     x, y = self.grid_to_world(row, col)
                     
-                    # Mark cells beyond left line as STRICTLY FORBIDDEN
+                    # Beyond left line -> FORBIDDEN
                     if left_boundary < 999.0 and y > left_boundary:
                         self.occupancy_grid[row, col] = self.forbidden_cost
                     
-                    # Mark cells beyond right line as STRICTLY FORBIDDEN
-                    if right_boundary > -999.0 and y < right_boundary:
+                    # Beyond right line -> FORBIDDEN
+                    elif right_boundary > -999.0 and y < right_boundary:
                         self.occupancy_grid[row, col] = self.forbidden_cost
         
-        # SECOND: Mark obstacles from LiDAR (but don't overwrite forbidden zones!)
+        # Step 2: Mark obstacles from LiDAR (don't overwrite forbidden zones)
         for point in lidar_points:
             x, y = point[0], point[1]
             grid_pos = self.world_to_grid(x, y)
             if grid_pos is not None:
                 row, col = grid_pos
                 
-                # Only mark as obstacle if NOT already forbidden
+                # Only mark if not already forbidden
                 if self.occupancy_grid[row, col] < self.forbidden_cost:
-                    # Inflate obstacle slightly (3x3 kernel)
+                    # Inflate obstacle (3x3)
                     for dr in [-1, 0, 1]:
                         for dc in [-1, 0, 1]:
                             r, c = row + dr, col + dc
                             if 0 <= r < self.grid_h and 0 <= c < self.grid_w:
                                 if self.occupancy_grid[r, c] < self.forbidden_cost:
-                                    self.occupancy_grid[r, c] = max(self.occupancy_grid[r, c], self.obstacle_cost)
+                                    self.occupancy_grid[r, c] = max(
+                                        self.occupancy_grid[r, c], 
+                                        self.obstacle_cost
+                                    )
+
+    def is_straight_path_clear(self):
+        """Check if straight path ahead is clear on the grid
+        
+        Returns: True if robot can go straight, False if needs to plan detour
+        """
+        # Check a narrow vertical strip in the center of the grid
+        center_col = self.grid_w // 2
+        strip_width = int(self.min_clear_width / self.grid_resolution)
+        
+        check_rows = int(self.path_check_distance / self.grid_resolution)
+        check_rows = min(check_rows, self.grid_h)
+        
+        # Check center strip for obstacles or forbidden zones
+        for row in range(check_rows):
+            for dc in range(-strip_width, strip_width + 1):
+                col = center_col + dc
+                if 0 <= col < self.grid_w:
+                    cost = self.occupancy_grid[row, col]
+                    # If any cell is blocked -> path not clear
+                    if cost >= self.obstacle_cost:
+                        return False
+        
+        return True
 
     def find_path_astar(self, start_pos, goal_pos):
         """A* pathfinding on occupancy grid
         
-        Args:
-            start_pos: (row, col) starting cell
-            goal_pos: (row, col) goal cell
-            
-        Returns:
-            List of (x, y) waypoints in world coordinates, or empty list if no path
+        Returns: List of (x, y) waypoints or empty list if no path
         """
         start_row, start_col = start_pos
         goal_row, goal_col = goal_pos
         
-        # Check if goal is in forbidden zone
+        # Check if goal is valid
         if self.occupancy_grid[goal_row, goal_col] >= self.forbidden_cost:
-            self.get_logger().warn('[A*] Goal is in forbidden zone! Cannot plan path.')
             return []
         
-        # Priority queue: (f_score, counter, (row, col))
-        counter = 0
-        open_set = [(0, counter, start_pos)]
-        counter += 1
-        
+        # Priority queue: (f_score, (row, col))
+        open_set = [(0, start_pos)]
         came_from = {}
         g_score = {start_pos: 0}
-        f_score = {start_pos: self.heuristic(start_pos, goal_pos)}
-        
-        visited = set()
+        closed_set = set()
         
         while open_set:
-            # Get node with lowest f_score
             open_set.sort(key=lambda x: x[0])
-            current_f, _, current = open_set.pop(0)
+            current_f, current = open_set.pop(0)
             
-            if current in visited:
+            if current in closed_set:
                 continue
-            visited.add(current)
+            closed_set.add(current)
             
-            # Check if reached goal
+            # Goal reached
             if current == goal_pos:
                 return self.reconstruct_path(came_from, current)
             
@@ -223,110 +233,82 @@ class OccupancyGridNavigator(Node):
                     if dr == 0 and dc == 0:
                         continue
                     
-                    neighbor_row = row + dr
-                    neighbor_col = col + dc
+                    neighbor = (row + dr, col + dc)
+                    nr, nc = neighbor
                     
-                    # Check bounds
-                    if not (0 <= neighbor_row < self.grid_h and 0 <= neighbor_col < self.grid_w):
+                    # Bounds check
+                    if not (0 <= nr < self.grid_h and 0 <= nc < self.grid_w):
                         continue
                     
-                    neighbor = (neighbor_row, neighbor_col)
-                    
-                    if neighbor in visited:
+                    if neighbor in closed_set:
                         continue
                     
-                    # Calculate movement cost
-                    diagonal = (dr != 0 and dc != 0)
-                    move_cost = 1.414 if diagonal else 1.0
+                    # Get cell cost
+                    cell_cost = self.occupancy_grid[nr, nc]
                     
-                    # Add grid cell cost
-                    cell_cost = self.occupancy_grid[neighbor_row, neighbor_col]
-                    
-                    # STRICTLY skip forbidden zones
+                    # SKIP forbidden cells
                     if cell_cost >= self.forbidden_cost:
                         continue
                     
+                    # Movement cost
+                    move_cost = 1.414 if (dr != 0 and dc != 0) else 1.0
                     tentative_g = g_score[current] + move_cost + cell_cost
                     
                     if neighbor not in g_score or tentative_g < g_score[neighbor]:
                         came_from[neighbor] = current
                         g_score[neighbor] = tentative_g
                         f = tentative_g + self.heuristic(neighbor, goal_pos)
-                        f_score[neighbor] = f
-                        open_set.append((f, counter, neighbor))
-                        counter += 1
+                        open_set.append((f, neighbor))
         
-        # No path found
-        self.get_logger().warn('[A*] No valid path found!')
-        return []
+        return []  # No path found
 
     def heuristic(self, pos1, pos2):
-        """Euclidean distance heuristic for A*"""
+        """Euclidean distance heuristic"""
         return np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
 
     def reconstruct_path(self, came_from, current):
-        """Reconstruct path from A* came_from dict
-        Returns list of (x, y) waypoints in world coordinates
-        """
+        """Reconstruct path and convert to world coordinates"""
         path = [current]
         while current in came_from:
             current = came_from[current]
             path.append(current)
         path.reverse()
         
-        # Convert grid coordinates to world coordinates
+        # Convert to world coordinates
         world_path = []
         for row, col in path:
             x, y = self.grid_to_world(row, col)
             world_path.append((x, y))
         
-        # Simplify path (keep every 4th waypoint to reduce oscillations)
-        simplified_path = world_path[::4]
-        if len(world_path) > 0 and world_path[-1] not in simplified_path:
-            simplified_path.append(world_path[-1])
+        # Simplify: keep every 3rd waypoint
+        simplified = world_path[::3]
+        if len(world_path) > 0 and world_path[-1] not in simplified:
+            simplified.append(world_path[-1])
         
-        return simplified_path
-
-    def get_closest_obstacle_distance(self):
-        """Get minimum distance to any obstacle in FRONT CORRIDOR ONLY"""
-        min_dist = 999.0
-        
-        # Only check obstacles in narrow corridor directly in front
-        for row in range(self.grid_h):
-            for col in range(self.grid_w):
-                x, y = self.grid_to_world(row, col)
-                
-                # IMPORTANT: Only check obstacles in front corridor
-                if abs(y) < self.corridor_width / 2:
-                    cost = self.occupancy_grid[row, col]
-                    # Only count actual obstacles, not forbidden zones
-                    if self.obstacle_cost <= cost < self.forbidden_cost:
-                        dist = x
-                        min_dist = min(min_dist, dist)
-        
-        return min_dist
+        return simplified
 
     def lidar_callback(self, scan_msg):
-        """Process LiDAR scan and build occupancy grid"""
+        """Process LiDAR scan"""
         ranges = np.array(scan_msg.ranges)
         ranges[ranges == 0] = float('inf')
         ranges[ranges == float('-inf')] = float('inf')
         ranges[np.isnan(ranges)] = float('inf')
 
-        # Rotate to have 0° at front
+        # Rotate to front
         ranges = np.roll(ranges, len(ranges)//2)
         angles = np.linspace(np.pi, 3*np.pi, len(ranges), endpoint=False)
 
-        # Convert to Cartesian coordinates
+        # Cartesian conversion
         x = ranges * np.cos(angles)
         y = ranges * np.sin(angles)
         
-        # Filter: only points in grid area and valid
-        mask = (x > 0) & (x < self.grid_length) & (np.abs(y) < self.grid_width/2) & (ranges < 10.0)
+        # Filter to grid area
+        mask = (x > 0) & (x < self.grid_length) & \
+               (np.abs(y) < self.grid_width/2) & (ranges < 10.0)
         
         lidar_points = np.column_stack([x[mask], y[mask]])
         
-        # Build occupancy grid
+        # Build grid
         self.build_occupancy_grid(lidar_points)
 
     def left_distance_callback(self, msg):
@@ -339,168 +321,147 @@ class OccupancyGridNavigator(Node):
         self.lane_state = msg.data
 
     def log_status(self):
-        """Log current status"""
-        state_names = {
-            0: "NORMAL",
-            1: "PLANNING",
-            2: "FOLLOWING_PATH",
-            3: "RETURNING"
-        }
-        current_state_name = state_names.get(self.state, "UNKNOWN")
-        left_boundary, right_boundary = self.get_lane_boundaries_in_meters()
-        min_obstacle_dist = self.get_closest_obstacle_distance()
+        """Log status"""
+        state_names = {0: "LANE_FOLLOW", 1: "PATH_FOLLOW", 2: "RETURNING"}
+        state_name = state_names.get(self.state, "UNKNOWN")
+        
+        left_b, right_b = self.get_lane_boundaries_in_meters()
+        straight_clear = self.is_straight_path_clear()
         
         self.get_logger().info(
-            f'State: {current_state_name} | '
-            f'Lanes: L={left_boundary:.2f}m R={right_boundary:.2f}m | '
-            f'Corridor obstacle: {min_obstacle_dist:.2f}m | '
+            f'[{state_name}] Lanes: L={left_b:.2f}m R={right_b:.2f}m | '
+            f'Straight: {"CLEAR" if straight_clear else "BLOCKED"} | '
             f'Path: {len(self.current_path)} pts'
         )
 
     def control_loop(self):
-        """Main control loop"""
-        if self.state == self.STATE_NORMAL:
-            self.handle_normal_state()
-        elif self.state == self.STATE_PLANNING:
-            self.handle_planning_state()
-        elif self.state == self.STATE_FOLLOWING_PATH:
-            self.handle_following_path_state()
+        """Main control loop - pure grid-based decision"""
+        
+        # Always check: is straight path clear?
+        straight_clear = self.is_straight_path_clear()
+        
+        if self.state == self.STATE_LANE_FOLLOWING:
+            if straight_clear:
+                # Path is clear -> continue lane following
+                self.handle_lane_following()
+            else:
+                # Path blocked -> need to plan detour
+                self.get_logger().warn('[GRID] Straight path blocked! Planning detour...')
+                self.plan_detour()
+        
+        elif self.state == self.STATE_PATH_FOLLOWING:
+            self.handle_path_following()
+        
         elif self.state == self.STATE_RETURNING:
-            self.handle_returning_state()
+            self.handle_returning()
 
-    def handle_normal_state(self):
-        """Normal driving - follow lane"""
+    def handle_lane_following(self):
+        """Normal lane following - grid is clear ahead"""
         avoid_active = Bool()
         avoid_active.data = False
         self.pub_avoid_active.publish(avoid_active)
-
-        # Adaptive speed based on obstacle distance IN CORRIDOR
-        min_obstacle_dist = self.get_closest_obstacle_distance()
+        
         max_vel = Float64()
-        
-        if min_obstacle_dist < self.clear_threshold:
-            # Slow down as approaching obstacle
-            scale = (min_obstacle_dist - self.obstacle_threshold) / (self.clear_threshold - self.obstacle_threshold)
-            scale = max(0.0, min(1.0, scale))
-            max_vel.data = 0.05 + (scale ** 0.5) * (self.normal_speed - 0.05)
-        else:
-            max_vel.data = self.normal_speed
-        
+        max_vel.data = self.lane_following_speed
         self.pub_max_vel.publish(max_vel)
 
-        # Trigger planning ONLY if obstacle in corridor
-        if min_obstacle_dist < self.obstacle_threshold:
-            self.state = self.STATE_PLANNING
-            self.get_logger().warn(f'[ALERT] Obstacle in corridor at {min_obstacle_dist:.2f}m! Planning...')
-
-    def handle_planning_state(self):
-        """Plan path around obstacle using A*"""
-        # Start position: robot at bottom center of grid
-        start_grid = self.world_to_grid(0.1, 0.0)  # slightly ahead
+    def plan_detour(self):
+        """Plan path around obstacle"""
+        # Start: slightly ahead of robot
+        start_grid = self.world_to_grid(0.1, 0.0)
         
-        # Goal position: straight ahead at far end of grid, centered
-        goal_x = self.grid_length - 0.3
+        # Goal: far end of grid, centered
+        goal_x = self.grid_length - 0.2
         goal_y = 0.0
         goal_grid = self.world_to_grid(goal_x, goal_y)
         
         if start_grid is None or goal_grid is None:
-            self.get_logger().error('[PLANNING] Invalid start/goal position!')
-            self.state = self.STATE_NORMAL
+            self.get_logger().error('[PLAN] Invalid start/goal!')
             return
         
-        # Find path
+        # Run A*
         path = self.find_path_astar(start_grid, goal_grid)
         
         if len(path) > 0:
             self.current_path = path
             self.path_index = 0
-            self.state = self.STATE_FOLLOWING_PATH
-            self.get_logger().info(f'[SUCCESS] Path found with {len(path)} waypoints!')
+            self.state = self.STATE_PATH_FOLLOWING
+            self.get_logger().info(f'[PLAN] Path found: {len(path)} waypoints')
         else:
-            # No path found - stop and wait
-            self.get_logger().warn('[PLANNING] No valid path! Stopping and retrying...')
+            # No path -> STOP (forbidden zones blocking?)
+            self.get_logger().error('[PLAN] NO PATH FOUND! Stopping.')
             self.pub_avoid_cmd.publish(Twist())  # Stop
             avoid_active = Bool()
             avoid_active.data = True
             self.pub_avoid_active.publish(avoid_active)
-            # Return to normal to let lane following handle it
-            self.state = self.STATE_NORMAL
 
-    def handle_following_path_state(self):
-        """Follow planned path using pure pursuit"""
+    def handle_path_following(self):
+        """Follow planned path"""
         avoid_active = Bool()
         avoid_active.data = True
         self.pub_avoid_active.publish(avoid_active)
         
-        if len(self.current_path) == 0 or self.path_index >= len(self.current_path):
+        if self.path_index >= len(self.current_path):
             # Path completed
             self.state = self.STATE_RETURNING
-            self.get_logger().info('[PATH] Path completed! Returning to lane...')
+            self.get_logger().info('[PATH] Completed! Returning...')
             return
         
-        # Get current target waypoint
+        # Get target waypoint
         target_x, target_y = self.current_path[self.path_index]
         
-        # Check if waypoint reached
-        distance_to_waypoint = np.sqrt(target_x**2 + target_y**2)
-        if distance_to_waypoint < self.path_following_threshold:
+        # Check if reached
+        dist = np.sqrt(target_x**2 + target_y**2)
+        if dist < self.waypoint_threshold:
             self.path_index += 1
             if self.path_index < len(self.current_path):
-                target_x, target_y = self.current_path[self.path_index]
-                self.get_logger().info(f'[PATH] Waypoint {self.path_index}/{len(self.current_path)}', throttle_duration_sec=0.5)
-            else:
-                self.state = self.STATE_RETURNING
-                return
+                self.get_logger().info(f'[PATH] Waypoint {self.path_index}/{len(self.current_path)}', 
+                                      throttle_duration_sec=0.5)
+            return
         
         # Pure pursuit control
         twist = Twist()
-        twist.linear.x = self.avoidance_speed
-        
-        # Calculate angular velocity to steer towards waypoint
-        angle_to_waypoint = np.arctan2(target_y, target_x)
-        twist.angular.z = self.waypoint_angular_gain * angle_to_waypoint
-        
-        # Limit angular velocity
-        max_angular = 1.2
-        twist.angular.z = np.clip(twist.angular.z, -max_angular, max_angular)
-        
+        twist.linear.x = self.path_following_speed
+        angle = np.arctan2(target_y, target_x)
+        twist.angular.z = np.clip(self.steering_gain * angle, -1.2, 1.2)
         self.pub_avoid_cmd.publish(twist)
         
-        # Check if new obstacle appeared IN CORRIDOR (not just anywhere!)
-        min_obstacle_dist = self.get_closest_obstacle_distance()
-        if min_obstacle_dist < self.obstacle_threshold * 0.3:  # Much closer than before
-            self.get_logger().warn('[PATH] Very close obstacle! Re-planning...')
-            self.state = self.STATE_PLANNING
+        # Re-plan if straight path becomes clear
+        if self.is_straight_path_clear():
+            self.state = self.STATE_RETURNING
+            self.get_logger().info('[PATH] Straight clear again! Returning...')
 
-    def handle_returning_state(self):
-        """Return to lane following after obstacle avoidance"""
-        # Check if obstacle still present in corridor
-        min_obstacle_dist = self.get_closest_obstacle_distance()
-        if min_obstacle_dist < self.obstacle_threshold:
-            self.state = self.STATE_PLANNING
+    def handle_returning(self):
+        """Return to centered lane following"""
+        
+        # Check if straight path is clear
+        if not self.is_straight_path_clear():
+            # Still blocked -> re-plan
+            self.get_logger().warn('[RETURN] Path blocked again! Re-planning...')
+            self.plan_detour()
             return
         
-        # Check if centered in lane
-        if self.lane_state == 2:  # Both lines detected
+        # Check if centered
+        if self.lane_state == 2:
             left_right_diff = abs(self.left_distance - self.right_distance)
-            if left_right_diff < 80.0:  # Well centered
-                self.state = self.STATE_NORMAL
-                self.get_logger().info('[RETURN] Successfully returned to lane!')
+            if left_right_diff < 100.0:
+                # Well centered -> back to normal
+                self.state = self.STATE_LANE_FOLLOWING
+                self.get_logger().info('[RETURN] Centered! Back to lane following.')
                 return
         
-        # Gentle steering to center
+        # Steer to center
         avoid_active = Bool()
         avoid_active.data = True
         self.pub_avoid_active.publish(avoid_active)
         
         twist = Twist()
-        twist.linear.x = self.avoidance_speed * 0.8
+        twist.linear.x = self.path_following_speed * 0.7
         
-        # Steer towards center based on lane distances
         if self.left_distance < self.right_distance:
-            twist.angular.z = -0.25  # Turn right
+            twist.angular.z = -0.3
         else:
-            twist.angular.z = 0.25  # Turn left
+            twist.angular.z = 0.3
         
         self.pub_avoid_cmd.publish(twist)
 
