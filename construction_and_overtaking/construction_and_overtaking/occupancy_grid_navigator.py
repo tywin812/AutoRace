@@ -6,6 +6,7 @@ from std_msgs.msg import Float64, UInt8, Bool, Header
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path, MapMetaData
 import numpy as np
+import time
 
 
 class OccupancyGridNavigator(Node):
@@ -82,13 +83,20 @@ class OccupancyGridNavigator(Node):
         self.steering_gain = 3.0
         self.look_ahead_distance = 0.4
         
+        # Smart rotation parameters
+        self.last_turn_direction = 0.0  # Positive = left, Negative = right
+        self.rotation_speed = 0.5  # rad/s for in-place rotation
+        self.no_path_start_time = None  # Track how long we've been stuck
+        self.max_rotation_time = 3.0  # Max time to rotate before switching direction
+        
         # Control timer
         self.timer = self.create_timer(0.1, self.control_loop)
         self.status_timer = self.create_timer(0.5, self.log_status)
 
-        self.get_logger().info('=== Grid Navigator with Width Validation ===' )
+        self.get_logger().info('=== Grid Navigator with Smart Rotation ===' )
         self.get_logger().info(f'Min passage width: {self.min_passage_width}m ({int(self.min_passage_width/self.grid_resolution)} cells)')
         self.get_logger().info(f'White line validation: min_width={self.min_lane_width_px}px, max_jump={self.max_jump_threshold_px}px')
+        self.get_logger().info(f'Rotation: {self.rotation_speed} rad/s, max time: {self.max_rotation_time}s')
         self.get_logger().info(f'Publishing to: /avoid_control, /avoid_active')
 
     def pixels_to_meters(self, pixel_distance):
@@ -215,6 +223,38 @@ class OccupancyGridNavigator(Node):
         total_width_cells = left_extent + 1 + right_extent  # +1 for current cell
         
         return total_width_cells >= min_width_cells
+
+    def analyze_grid_for_rotation_direction(self):
+        """
+        Analyze occupancy grid to determine best rotation direction.
+        Looks at free space on left vs right side.
+        
+        Returns:
+            float: Positive for left rotation, negative for right rotation
+        """
+        # Count free space on left (positive Y) vs right (negative Y)
+        center_col = self.grid_w // 2
+        
+        left_free = 0
+        right_free = 0
+        
+        # Check forward area (rows 10-40 = 0.2-0.8m)
+        for row in range(10, min(40, self.grid_h)):
+            # Left side
+            for col in range(center_col, self.grid_w):
+                if self.occupancy_grid[row, col] < self.obstacle_cost:
+                    left_free += 1
+            
+            # Right side
+            for col in range(0, center_col):
+                if self.occupancy_grid[row, col] < self.obstacle_cost:
+                    right_free += 1
+        
+        # Return direction with more free space
+        if left_free > right_free:
+            return self.rotation_speed  # Turn left (positive)
+        else:
+            return -self.rotation_speed  # Turn right (negative)
 
     def build_occupancy_grid(self, lidar_points, stamp, frame_id):
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
@@ -524,8 +564,72 @@ class OccupancyGridNavigator(Node):
         roi = self.occupancy_grid[start_row:end_row, start_col:end_col]
         return np.any(roi == self.obstacle_cost)
 
+    def rotate_to_find_path(self):
+        """
+        Rotate in place to search for a viable path.
+        Uses last turn direction or analyzes grid to choose direction.
+        """
+        current_time = time.time()
+        
+        # Initialize rotation if just starting
+        if self.no_path_start_time is None:
+            self.no_path_start_time = current_time
+            
+            # Determine rotation direction
+            if abs(self.last_turn_direction) > 0.01:
+                # Use last successful turn direction
+                rotation_dir = np.sign(self.last_turn_direction)
+                self.get_logger().info(
+                    f'[ROTATE] Using last turn direction: {"LEFT" if rotation_dir > 0 else "RIGHT"}',
+                    throttle_duration_sec=1.0
+                )
+            else:
+                # Analyze grid to choose direction
+                rotation_dir = np.sign(self.analyze_grid_for_rotation_direction())
+                self.get_logger().info(
+                    f'[ROTATE] Analyzing grid, choosing: {"LEFT" if rotation_dir > 0 else "RIGHT"}',
+                    throttle_duration_sec=1.0
+                )
+            
+            self.current_rotation_dir = rotation_dir * self.rotation_speed
+        
+        # Check if we should switch direction
+        elapsed = current_time - self.no_path_start_time
+        if elapsed > self.max_rotation_time:
+            # Switch direction
+            self.current_rotation_dir = -self.current_rotation_dir
+            self.no_path_start_time = current_time
+            self.get_logger().warn(
+                f'[ROTATE] Switching direction after {self.max_rotation_time}s',
+                throttle_duration_sec=1.0
+            )
+        
+        # Execute rotation
+        twist = Twist()
+        twist.linear.x = 0.0  # No forward movement
+        twist.angular.z = self.current_rotation_dir
+        self.pub_cmd.publish(twist)
+        
+        # Stay active
+        avoid_active = Bool()
+        avoid_active.data = True
+        self.pub_avoid_active.publish(avoid_active)
+        
+        max_vel = Float64()
+        max_vel.data = 0.0
+        self.pub_max_vel.publish(max_vel)
+        
+        self.get_logger().info(
+            f'[ROTATE] Spinning {"LEFT" if self.current_rotation_dir > 0 else "RIGHT"} '
+            f'({elapsed:.1f}s)',
+            throttle_duration_sec=0.5
+        )
+
     def control_loop(self):
         if not self.check_obstacles():
+            # Reset rotation state when clear
+            self.no_path_start_time = None
+            
             avoid_active = Bool()
             avoid_active.data = False
             self.pub_avoid_active.publish(avoid_active)
@@ -605,15 +709,18 @@ class OccupancyGridNavigator(Node):
             goal_grid = self.world_to_grid(0.5, 0.0)
 
         if start_grid is None or goal_grid is None:
-            self.stop()
+            self.rotate_to_find_path()  # Smart rotation instead of stop
             return
         
         path = self.find_path_astar(start_grid, goal_grid)
         
         if len(path) == 0:
-            self.get_logger().warn('[NO PATH] A* failed - narrow gaps detected', throttle_duration_sec=1.0)
-            self.stop()
+            self.get_logger().warn('[NO PATH] Rotating to find exit...', throttle_duration_sec=1.0)
+            self.rotate_to_find_path()  # Smart rotation instead of stop
             return
+        
+        # Path found! Reset rotation state
+        self.no_path_start_time = None
         
         self.current_path = path
         if hasattr(self, 'last_frame_id'):
@@ -641,7 +748,7 @@ class OccupancyGridNavigator(Node):
         target = self.find_lookahead_point()
         
         if target is None:
-            self.stop()
+            self.rotate_to_find_path()  # Smart rotation instead of stop
             return
         
         target_x, target_y = target
@@ -651,6 +758,9 @@ class OccupancyGridNavigator(Node):
         angle_to_target = np.arctan2(target_y, target_x)
         twist.angular.z = self.steering_gain * angle_to_target
         twist.angular.z = np.clip(twist.angular.z, -1.5, 1.5)
+        
+        # Remember last turn direction for smart rotation
+        self.last_turn_direction = twist.angular.z
         
         self.pub_cmd.publish(twist)
         
