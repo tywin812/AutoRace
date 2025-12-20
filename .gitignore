@@ -33,3 +33,9 @@
 
 # Misc
 .vscode/
+build/
+install/
+log/
+referee_console/
+robot_bringup/
+robot_description/
