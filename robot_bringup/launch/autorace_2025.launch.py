@@ -36,8 +36,8 @@ def generate_launch_description():
         executable='create',
         arguments=['-name', 'robot',
                    '-topic', 'robot_description',
-                   '-x', '1.15',
-                   '-y', '-2.2',
+                   '-x', '0.8603',
+                   '-y', '0.1800',
                    '-z', '0.08',
                 ],
         output='screen',
@@ -79,6 +79,31 @@ def generate_launch_description():
         output='screen'
     )
 
+    # Lane detection nodes
+    bird_view_node = Node(
+        package='lane_detection',
+        executable='bird_view',
+        name='bird_view',
+        output='screen',
+        parameters=[{"use_sim_time": True}]
+    )
+
+    detect_lanes_node = Node(
+        package='lane_detection',
+        executable='detect_lanes',
+        name='detect_lanes',
+        output='screen',
+        parameters=[{"use_sim_time": True}]
+    )
+
+    follow_lanes_node = Node(
+        package='lane_detection',
+        executable='follow_lanes',
+        name='follow_lanes',
+        output='screen',
+        parameters=[{"use_sim_time": True}]
+    )
+
     return LaunchDescription([
         gz_sim,
         DeclareLaunchArgument('rviz', default_value='true',
@@ -86,6 +111,9 @@ def generate_launch_description():
         bridge,
         robot_state_publisher,
         rviz,
+        bird_view_node,
+        detect_lanes_node,
+        follow_lanes_node,
         TimerAction(
             period=0.0,
             actions=[create])
