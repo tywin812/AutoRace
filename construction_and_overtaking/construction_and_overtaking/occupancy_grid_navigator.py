@@ -85,9 +85,9 @@ class OccupancyGridNavigator(Node):
         
         # Smart rotation parameters
         self.last_turn_direction = 0.0  # Positive = left, Negative = right
-        self.rotation_speed = 0.5  # rad/s for in-place rotation
+        self.rotation_speed = 0.25  # rad/s - REDUCED from 0.5 for smoother rotation
         self.no_path_start_time = None  # Track how long we've been stuck
-        self.max_rotation_time = 3.0  # Max time to rotate before switching direction
+        self.max_rotation_time = 4.0  # Increased from 3.0s since we rotate slower
         
         # Control timer
         self.timer = self.create_timer(0.1, self.control_loop)
@@ -96,7 +96,7 @@ class OccupancyGridNavigator(Node):
         self.get_logger().info('=== Grid Navigator with Smart Rotation ===' )
         self.get_logger().info(f'Min passage width: {self.min_passage_width}m ({int(self.min_passage_width/self.grid_resolution)} cells)')
         self.get_logger().info(f'White line validation: min_width={self.min_lane_width_px}px, max_jump={self.max_jump_threshold_px}px')
-        self.get_logger().info(f'Rotation: {self.rotation_speed} rad/s, max time: {self.max_rotation_time}s')
+        self.get_logger().info(f'Rotation: {self.rotation_speed} rad/s (slow & precise), max time: {self.max_rotation_time}s')
         self.get_logger().info(f'Publishing to: /avoid_control, /avoid_active')
 
     def pixels_to_meters(self, pixel_distance):
@@ -719,7 +719,9 @@ class OccupancyGridNavigator(Node):
             self.rotate_to_find_path()  # Smart rotation instead of stop
             return
         
-        # Path found! Reset rotation state
+        # Path found! Reset rotation state and STOP rotating immediately
+        if self.no_path_start_time is not None:
+            self.get_logger().info('[PATH FOUND] Stopping rotation, executing path!', throttle_duration_sec=0.5)
         self.no_path_start_time = None
         
         self.current_path = path
