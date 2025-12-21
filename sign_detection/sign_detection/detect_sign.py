@@ -23,7 +23,7 @@ class YoloSignDetector(Node):
             Image,
             '/color/image',
             self.image_callback,
-            50
+            10
         )
 
         pkg_share = get_package_share_directory('sign_detection')
@@ -43,31 +43,47 @@ class YoloSignDetector(Node):
         }
 
         self.conf_threshold = 0.80
+
         self.pub = self.create_publisher(
             DetectionMessage,
             '/detections',
             50
         )
-        self.get_logger().info('YOLO sign detector started')
+
+        self.latest_frame = None
+
+        self.process_rate = 4.0
+        self.timer = self.create_timer(
+            1.0 / self.process_rate,
+            self.process_frame
+        )
+
+        self.get_logger().info('YOLO detector started')
 
     def image_callback(self, msg):
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        self.latest_frame = self.bridge.imgmsg_to_cv2(
+            msg, desired_encoding='bgr8'
+        )
+
+    def process_frame(self):
+        if self.latest_frame is None:
+            return
+
+        frame = self.latest_frame
 
         results = self.model(
             frame,
             conf=self.conf_threshold,
             verbose=False
         )
-        if not results:
-            return
 
-        detections = results[0].boxes
-        if detections is None:
+        if not results or results[0].boxes is None:
             return
 
         for box in results[0].boxes:
             cls_id = int(box.cls[0])
             conf = float(box.conf[0])
+
             x_center = float(box.xywh[0][0]) / frame.shape[1]
             y_center = float(box.xywh[0][1]) / frame.shape[0]
             width = float(box.xywh[0][2]) / frame.shape[1]
@@ -83,9 +99,11 @@ class YoloSignDetector(Node):
             msg_out.stamp = self.get_clock().now().to_msg()
 
             self.pub.publish(msg_out)
+
             self.get_logger().info(
                 f'Published: {msg_out.class_name} ({conf:.2f})'
             )
+
 
 def main(args=None):
     rclpy.init(args=args)
