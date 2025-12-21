@@ -2,6 +2,7 @@ INSTALL.txt
 build/
 install/
 log/
+lane_detection/
 # Prerequisites
 *.d
 
