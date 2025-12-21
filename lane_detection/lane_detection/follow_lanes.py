@@ -18,18 +18,8 @@ class ControlLane(Node):
             1
         )
 
-        self.sub_avoid_cmd = self.create_subscription(
-            Twist,
-            '/avoid_control',
-            self.callback_avoid_cmd,
-            1
-        )
-
-        self.sub_avoid_active = self.create_subscription(
-            Bool,
-            '/avoid_active',
-            self.callback_avoid_active,
-            1
+        self.sub_control_active = self.create_subscription(
+            Bool, '/lane_control_active', self.callback_control_active, 1
         )
 
         self.pub_cmd_vel = self.create_publisher(
@@ -44,13 +34,18 @@ class ControlLane(Node):
         self.base_speed = 0.6
         self.first_callback = True 
 
-        self.avoid_active = False
-        self.avoid_twist = Twist()
+        self.control_active = True
 
+    def callback_control_active(self, msg):
+        self.control_active = msg.data
+        if not self.control_active:
+            self.get_logger().info("Lane control deactivated")
+            
     def callback_follow_lane(self, msg):
-        if self.avoid_active:
-            return
 
+        if not self.control_active:
+            return
+        
         error = msg.data
 
         Kp = 1.5 #1.4
