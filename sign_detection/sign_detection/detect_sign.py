@@ -39,7 +39,8 @@ class YoloSignDetector(Node):
         self.class_names = {
             0: 'left',
             1: 'right',
-            2: 'construction'
+            2: 'construction',
+            3: 'tunnel'
         }
 
         self.conf_threshold = 0.80
