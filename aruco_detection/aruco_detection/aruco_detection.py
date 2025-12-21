@@ -4,9 +4,9 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Float32
 from cv_bridge import CvBridge
 import cv2
-import numpy as np
 import math
 
+from aruco_interfaces.msg import ArucoDetection
 
 class ArucoDetector(Node):
     def __init__(self):
@@ -26,6 +26,13 @@ class ArucoDetector(Node):
             '/mission_aruco',
             10
         )
+
+        self.detect_pub = self.create_publisher(
+            ArucoDetection,
+            '/aruco_detections',
+            20
+        )
+
 
         self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_6X6_250)
         self.aruco_params = cv2.aruco.DetectorParameters_create()
@@ -55,7 +62,13 @@ class ArucoDetector(Node):
         marker_corners = corners[0][0]
 
         area = cv2.contourArea(marker_corners)
-        print(f"Area: {area}")
+
+        det_msg = ArucoDetection()
+        det_msg.id = marker_id
+        det_msg.area = area
+        det_msg.stamp = self.get_clock().now().to_msg()
+        self.detect_pub.publish(det_msg)
+
         if area < self.min_marker_area:
             return
         
@@ -64,7 +77,7 @@ class ArucoDetector(Node):
         msg_out.data = sqrt_id
         self.pub.publish(msg_out)
 
-        self.get_logger().info(f"Detected Aruco ID {int(marker_id)}, sqrt={sqrt_id:.5f}")
+        self.get_logger().info(f"Detected Mission Aruco ID {int(marker_id)}, sqrt={sqrt_id:.5f}")
         
         self.finished = True
         self.destroy_subscription(self.subscription)
