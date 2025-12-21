@@ -134,6 +134,11 @@ class RaceController(Node):
 
         return twist
     
+    def shut_down(self):
+        self.get_logger().info('Shutting down. cmd_vel will be 0')
+        twist = Twist()
+        self.pub_cmd_vel.publish(twist)
+    
 def main(args=None):
     rclpy.init(args=args)
     node = RaceController()

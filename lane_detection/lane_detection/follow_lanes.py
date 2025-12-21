@@ -40,7 +40,7 @@ class ControlLane(Node):
         self.control_active = msg.data
         if not self.control_active:
             self.get_logger().info("Lane control deactivated")
-            
+
     def callback_follow_lane(self, msg):
 
         if not self.control_active:
@@ -66,19 +66,6 @@ class ControlLane(Node):
         twist.linear.x = min(max(self.base_speed * speed_factor, -0.85), 0.85)
         twist.angular.z = -max(min(angular_z, 1.0), -1.0)
         self.pub_cmd_vel.publish(twist)
-
-    def callback_avoid_cmd(self, twist_msg):
-        self.avoid_twist = twist_msg
-
-        if self.avoid_active:
-            self.pub_cmd_vel.publish(self.avoid_twist)
-
-    def callback_avoid_active(self, bool_msg):
-        self.avoid_active = bool_msg.data
-        if self.avoid_active:
-            self.get_logger().info('Avoidance mode activated.')
-        else:
-            self.get_logger().info('Avoidance mode deactivated. Returning to lane following.')
 
     def shut_down(self):
         self.get_logger().info('Shutting down. cmd_vel will be 0')
