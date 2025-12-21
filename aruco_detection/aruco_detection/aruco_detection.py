@@ -30,28 +30,50 @@ class ArucoDetector(Node):
         self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_6X6_250)
         self.aruco_params = cv2.aruco.DetectorParameters_create()
 
-        self.published = False
+        self.finished = False
+        self.min_marker_area = 3500.0
 
         self.get_logger().info("Aruco detector node started")
 
     def image_callback(self, msg):
+        if self.finished:
+            return
+
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        _, marker_id, _ = cv2.aruco.detectMarkers(
+        corners, marker_id, _ = cv2.aruco.detectMarkers(
             gray,
             self.aruco_dict,
             parameters=self.aruco_params
         )
 
-        if not self.published and marker_id is not None:
-            sqrt_id = math.sqrt(int(marker_id))
-            msg_out = Float32()
-            msg_out.data = sqrt_id
-            self.pub.publish(msg_out)
-            self.get_logger().info(f"Detected ArUco ID {int(marker_id)}, sqrt={sqrt_id:.5f}")
-            self.published = True
+        if marker_id is None:
+            return
 
+        marker_id = int(marker_id[0][0])
+        marker_corners = corners[0][0]
+
+        area = cv2.contourArea(marker_corners)
+        print(f"Area: {area}")
+        if area < self.min_marker_area:
+            return
+        
+        sqrt_id = math.sqrt(int(marker_id))
+        msg_out = Float32()
+        msg_out.data = sqrt_id
+        self.pub.publish(msg_out)
+
+        self.get_logger().info(f"Detected Aruco ID {int(marker_id)}, sqrt={sqrt_id:.5f}")
+        
+        self.finished = True
+        self.destroy_subscription(self.subscription)
+        self.create_timer(0.1, self.shutdown)
+
+    def shutdown(self):
+        self.get_logger().info("Aruco detector finished, shutting down")
+        self.destroy_node()
+        rclpy.shutdown()
 
 def main(args=None):
     rclpy.init(args=args)
