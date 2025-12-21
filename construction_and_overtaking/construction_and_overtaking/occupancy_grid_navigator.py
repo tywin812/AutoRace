@@ -82,12 +82,12 @@ class OccupancyGridNavigator(Node):
         self.obstacle_cost = 100.0    # Physical obstacles
         
         # Control parameters
-        self.speed = 0.18
-        self.steering_gain = 1.5 # Reduced from 3.0 to prevent sharp turns
+        self.speed = 0.12 # Slower for cones
+        self.steering_gain = 1.0 # Reduced proportionally
         self.look_ahead_distance = 0.5 # Increased from 0.4 for smoother path following
         
         # Smart rotation parameters
-        self.rotation_speed = 0.2  # rad/s - Reduced from 0.8 (too fast)
+        self.rotation_speed = 0.15  # rad/s - Very slow rotation
         self.no_path_start_time = None  # Track how long we've been stuck
         self.max_rotation_time = 10.0  # Doubled since rotation is 2x slower
         self.rotating_mode = False  # Are we in rotation mode?
