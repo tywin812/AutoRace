@@ -23,6 +23,7 @@ class OccupancyGridNavigator(Node):
         self.sub_scan = self.create_subscription(LaserScan, '/scan', self.lidar_callback, 10)
         self.sub_left_distance = self.create_subscription(Float64, '/lane_left_distance', self.left_distance_callback, 10)
         self.sub_right_distance = self.create_subscription(Float64, '/lane_right_distance', self.right_distance_callback, 10)
+        self.sub_tunnel_entered = self.create_subscription(Bool, '/tunnel/entered', self.tunnel_entered_callback, 10)
         
         # Subscribe to lane paths
         self.sub_left_path = self.create_subscription(Path, '/detect/lane_left_path', self.left_path_callback, 10)
@@ -99,11 +100,22 @@ class OccupancyGridNavigator(Node):
         self.timer = self.create_timer(0.1, self.control_loop)
         self.status_timer = self.create_timer(2.0, self.log_status)  # Every 2s
 
+        # Activation state
+        self.declare_parameter('enable_on_start', True)
+        self.is_active = self.get_parameter('enable_on_start').value
+        if not self.is_active:
+            self.get_logger().info("Waiting for activation signal on /tunnel/entered...")
+
         self.get_logger().info('=== Grid Navigator with Reactive Rotation ===' )
         self.get_logger().info(f'Min passage width: {self.min_passage_width}m ({int(self.min_passage_width/self.grid_resolution)} cells)')
         self.get_logger().info(f'White line validation: min_width={self.min_lane_width_px}px, max_jump={self.max_jump_threshold_px}px')
         self.get_logger().info(f'Rotation: {self.rotation_speed} rad/s (~6°/s VERY SLOW), max time: {self.max_rotation_time}s')
         self.get_logger().info(f'Publishing to: /avoid_control, /avoid_active')
+
+    def tunnel_entered_callback(self, msg):
+        if msg.data and not self.is_active:
+            self.is_active = True
+            self.get_logger().info("ACTIVATED by /tunnel/entered signal!")
 
     def pixel_counts_callback(self, msg):
         self.white_pixels = msg.x
@@ -612,6 +624,9 @@ class OccupancyGridNavigator(Node):
         return np.any(roi == self.obstacle_cost)
 
     def control_loop(self):
+        if not self.is_active:
+            return
+
         if not self.check_obstacles():
             # Reset rotation state when clear
             self.no_path_start_time = None

@@ -3,7 +3,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, Command
@@ -11,6 +11,35 @@ from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.actions import Node
 from launch.actions import TimerAction
 
+def launch_setup(context, *args, **kwargs):
+    spawn_mode = LaunchConfiguration('spawn_mode').perform(context)
+    
+    # Default coordinates
+    x = '0.8603'
+    y = '0.1800'
+    z = '0.08'
+    yaw = '0.0'
+    
+    if spawn_mode == 'tunnel':
+        x = '-2.1248'
+        y = '0.5010'
+        z = '0.0338'
+        yaw = '-1.5876'
+
+    create = Node(
+        package='ros_gz_sim',
+        executable='create',
+        arguments=['-name', 'robot',
+                   '-topic', 'robot_description',
+                   '-x', x,
+                   '-y', y,
+                   '-z', z,
+                   '-Y', yaw,
+                ],
+        output='screen',
+    )
+    
+    return [create]
 
 def generate_launch_description():
     # Configure ROS nodes for launch
@@ -31,16 +60,10 @@ def generate_launch_description():
     )
 
     # Spawn robot
-    create = Node(
-        package='ros_gz_sim',
-        executable='create',
-        arguments=['-name', 'robot',
-                   '-topic', 'robot_description',
-                   '-x', '0.8603',
-                   '-y', '0.1800',
-                   '-z', '0.08',
-                ],
-        output='screen',
+    spawn_mode_arg = DeclareLaunchArgument(
+        'spawn_mode',
+        default_value='default',
+        description='Spawn location mode (default, tunnel)'
     )
 
     # Takes the description and joint angles as inputs and publishes the 3D poses of the robot links
@@ -105,6 +128,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        spawn_mode_arg,
         gz_sim,
         DeclareLaunchArgument('rviz', default_value='true',
                               description='Open RViz.'),
@@ -116,5 +140,5 @@ def generate_launch_description():
         follow_lanes_node,
         TimerAction(
             period=0.0,
-            actions=[create])
+            actions=[OpaqueFunction(function=launch_setup)])
     ])
