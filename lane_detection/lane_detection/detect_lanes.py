@@ -11,7 +11,7 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Float64
 from std_msgs.msg import UInt8
 from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Point
 
 
 class DetectLane(Node):
@@ -121,6 +121,9 @@ class DetectLane(Node):
         # NEW: Publishers for full lane paths
         self.pub_left_path = self.create_publisher(Path, '/detect/lane_left_path', 1)
         self.pub_right_path = self.create_publisher(Path, '/detect/lane_right_path', 1)
+        
+        # NEW: Publish pixel counts for navigator
+        self.pub_pixel_counts = self.create_publisher(Point, '/detect/lane_pixel_counts', 1)
 
         self.cvBridge = CvBridge()
 
@@ -170,6 +173,16 @@ class DetectLane(Node):
         white_fraction, cv_white_lane = self.maskWhiteLane(hsv_image)
         yellow_fraction, cv_yellow_lane = self.maskYellowLane(hsv_image)
 
+        # Log pixel counts for tuning
+        self.get_logger().info(f'Pixels - White: {white_fraction}, Yellow: {yellow_fraction}', throttle_duration_sec=0.5)
+
+        # Publish pixel counts
+        counts_msg = Point()
+        counts_msg.x = float(white_fraction)
+        counts_msg.y = float(yellow_fraction)
+        counts_msg.z = 0.0
+        self.pub_pixel_counts.publish(counts_msg)
+
         try:
             if yellow_fraction > 3000:
                 self.left_fitx, self.left_fit = self.fit_from_lines(
@@ -214,11 +227,56 @@ class DetectLane(Node):
 
         self.make_lane(bgr_image, white_fraction, yellow_fraction)
 
+    def filter_cones(self, mask):
+        """
+        Filters out blob-like objects (cones) and keeps line-like objects.
+        """
+        # Find contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        clean_mask = np.zeros_like(mask)
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 20: # Ignore tiny noise (was 50)
+                continue
+                
+            # Get bounding rect
+            x, y, w, h = cv2.boundingRect(cnt)
+            
+            # Aspect ratio: Height / Width
+            aspect_ratio = float(h) / w
+            
+            # Solidity: Contour Area / Bounding Box Area
+            # Cones are solid blobs (high solidity). 
+            # Diagonal lines are sparse in their bounding box (low solidity).
+            rect_area = w * h
+            solidity = float(area) / rect_area if rect_area > 0 else 0
+            
+            # Filter logic:
+            # 1. Keep elongated objects (Lines)
+            if aspect_ratio > 1.5 or aspect_ratio < 0.6:
+                cv2.drawContours(clean_mask, [cnt], -1, 255, -1)
+            
+            # 2. Check "square-ish" objects (0.6 <= AR <= 1.5)
+            else:
+                # If it's a solid blob -> Cone -> Ignore
+                if solidity > 0.6:
+                    pass 
+                # If it's sparse (diagonal line) -> Keep
+                else:
+                    cv2.drawContours(clean_mask, [cnt], -1, 255, -1)
+                
+        return clean_mask
+
     def maskWhiteLane(self, hsv):
         lower_white = np.array([self.hue_white_l, self.saturation_white_l, self.brightness_white_l])
         upper_white = np.array([self.hue_white_h, self.saturation_white_h, self.brightness_white_h])
 
         mask = cv2.inRange(hsv, lower_white, upper_white)
+        
+        # Apply cone filtering
+        mask = self.filter_cones(mask)
 
         fraction_num = np.count_nonzero(mask)
 
@@ -498,14 +556,23 @@ class DetectLane(Node):
             # Publish Paths
             ppm = 750.0 # pixels per meter (approx based on 450px / 0.6m)
             
+            # Cutoff for perspective correction (ignore top 40% of image)
+            # This prevents "converging lines" from looking like a wall on the grid
+            y_cutoff = cv_image.shape[0] * 0.4
+            
             if yellow_fraction > 3000:
                 path_msg = Path()
                 path_msg.header.frame_id = "robot/base_link"
                 path_msg.header.stamp = self.get_clock().now().to_msg()
                 
-                # Sample points (every 20th point)
-                for i in range(0, len(ploty), 20):
+                # Sample points (every 5th point for denser line)
+                for i in range(0, len(ploty), 5):
                     y_px = ploty[i]
+                    
+                    # Skip far points (top of image)
+                    if y_px < y_cutoff:
+                        continue
+                        
                     x_px = self.left_fitx[i]
                     
                     # Convert to Robot Frame
@@ -529,8 +596,14 @@ class DetectLane(Node):
                 path_msg.header.frame_id = "robot/base_link"
                 path_msg.header.stamp = self.get_clock().now().to_msg()
                 
-                for i in range(0, len(ploty), 20):
+                # Sample points (every 5th point for denser line)
+                for i in range(0, len(ploty), 5):
                     y_px = ploty[i]
+                    
+                    # Skip far points (top of image)
+                    if y_px < y_cutoff:
+                        continue
+                        
                     x_px = self.right_fitx[i]
                     
                     x_robot = (cv_image.shape[0] - y_px) / ppm
