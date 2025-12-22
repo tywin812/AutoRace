@@ -31,6 +31,12 @@ def generate_launch_description():
         name='detect_sign'
     )
 
+    detect_aruco_node = Node(
+        package='aruco_detection',
+        executable='detect_aruco',
+        name='detect_aruco'
+    )
+
     race_controller_node = Node(
         package='autorace_core_erevan',
         executable='race_controller',
@@ -43,5 +49,6 @@ def generate_launch_description():
         detect_lanes_node,
         follow_lanes_node,
         detect_signes_node,
+        detect_aruco_node,
         race_controller_node,
     ])
