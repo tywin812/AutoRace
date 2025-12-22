@@ -3,11 +3,14 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float64, Bool
-from detection_interfaces.msg import DetectionMessage
 from enum import Enum
+
+from detection_interfaces.msg import DetectionMessage
+from traffic_light_interfaces.msg import TrafficLightState
 
 
 class RaceState(Enum):
+    WAIT_FOR_GREEN = 0
     LANE_FOLLOWING = 1
     SIGN_DETECTED = 2
     APPROACHING_TURN = 3
@@ -22,11 +25,14 @@ class RaceController(Node):
         self.sub_detection = self.create_subscription(
             DetectionMessage, '/detections', self.cbDetection, 1
         )
+        self.sub_traffic_light = self.create_subscription(
+            TrafficLightState, '/traffic_light_state', self.cbTrafficLight, 1
+        )
         
         self.pub_cmd_vel = self.create_publisher(Twist, '/cmd_vel', 1)
         self.pub_lane_control_active = self.create_publisher(Bool, '/lane_control_active', 1)
 
-        self.current_state = RaceState.LANE_FOLLOWING
+        self.current_state = RaceState.WAIT_FOR_GREEN
         self.detected_sign = None
         self.lane_error = 0.0
         self.last_error = 0.0
@@ -87,7 +93,23 @@ class RaceController(Node):
                 self.current_state = RaceState.APPROACHING_TURN
                 self.get_logger().info(f"TRIGGER! area={sign_area:.3f}")
 
+    def cbTrafficLight(self, msg):
+        if self.current_state != RaceState.WAIT_FOR_GREEN:
+            return
+
+        if msg.state == TrafficLightState.GREEN:
+            self.get_logger().info("GREEN light received - starting race!")
+            self.current_state = RaceState.LANE_FOLLOWING
+
     def control_loop(self):
+        if self.current_state == RaceState.WAIT_FOR_GREEN:
+            self.pub_lane_control_active.publish(Bool(data=False))
+
+            twist = Twist()
+            twist.linear.x = 0.0
+            twist.angular.z = 0.0
+            self.pub_cmd_vel.publish(twist)
+            return
         
         if self.current_state == RaceState.LANE_FOLLOWING:
             self.pub_lane_control_active.publish(Bool(data=True))
