@@ -11,10 +11,7 @@ import cv2
 
 
 class OccupancyGridNavigator(Node):
-    """Ultra-Pure Occupancy Grid Navigation with Passage Width Validation
-    
-    Grid -> Validate Width -> Plan -> Follow
-    """
+    """Навигация с сеткой занятости для объезда конусов"""
 
     def __init__(self):
         super().__init__('occupancy_grid_navigator')
@@ -25,7 +22,6 @@ class OccupancyGridNavigator(Node):
         self.sub_right_distance = self.create_subscription(Float64, '/lane_right_distance', self.right_distance_callback, 10)
         self.sub_tunnel_entered = self.create_subscription(Bool, '/tunnel/entered', self.tunnel_entered_callback, 10)
         
-        # Subscribe to lane paths
         self.sub_left_path = self.create_subscription(Path, '/detect/lane_left_path', self.left_path_callback, 10)
         self.sub_right_path = self.create_subscription(Path, '/detect/lane_right_path', self.right_path_callback, 10)
         self.sub_pixel_counts = self.create_subscription(Point, '/detect/lane_pixel_counts', self.pixel_counts_callback, 10)
@@ -35,11 +31,10 @@ class OccupancyGridNavigator(Node):
         self.pub_avoid_active = self.create_publisher(Bool, '/avoid_active', 10)
         self.pub_max_vel = self.create_publisher(Float64, '/control/max_vel', 10)
         
-        # Debug Publishers
         self.pub_grid = self.create_publisher(OccupancyGrid, '/debug/grid', 10)
         self.pub_path = self.create_publisher(Path, '/debug/path', 10)
 
-        # State
+        # Состояние
         self.left_distance = 999.0
         self.right_distance = 999.0
         self.white_pixels = 0.0
@@ -48,74 +43,72 @@ class OccupancyGridNavigator(Node):
         self.left_lane_path = []
         self.right_lane_path = []
         
-        # Grid parameters
-        self.grid_resolution = 0.02  # 2cm cells for high precision
+        # Параметры сетки
+        self.grid_resolution = 0.02  # 2см на клетку
         self.grid_width = 2.0
         self.grid_length = 2.0
         self.grid_w = int(self.grid_width / self.grid_resolution)
         self.grid_h = int(self.grid_length / self.grid_resolution)
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         
-        # Robot parameters
-        self.robot_width = 0.10  # 10cm physical width
-        self.robot_radius = 0.10  # 10cm (Physical limit + small margin)
-        self.safety_radius = 0.30 # 30cm (Gradient zone for smooth avoidance)
+        # Размеры робота
+        self.robot_width = 0.10
+        self.robot_radius = 0.10  # физический радиус + запас
+        self.safety_radius = 0.30  # зона градиента для плавного объезда
         
-        # Passage validation
-        self.min_passage_width = 0.15  # 15cm minimum (Just enough for robot + wiggle room)
+        # Проверка ширины прохода
+        self.min_passage_width = 0.15  # минимум для проезда
         
-        # Lane parameters
+        # Параметры полосы
         self.lane_width_pixels = 450.0
         self.lane_width_meters = 0.6
         self.pixels_per_meter = self.lane_width_pixels / self.lane_width_meters
-        self.lane_boundary_margin = 0.05 # Reduced to 0.05 (closer to robot)
+        self.lane_boundary_margin = 0.05
         
-        # White line validation parameters
-        self.min_lane_width_px = 400.0  # Minimum expected lane width (53cm)
-        self.right_distance_history = []  # History for stability check
-        self.history_length = 10  # 1 second at 10Hz
-        self.max_jump_threshold_px = 150.0  # Maximum allowed sudden change
-        self.white_line_valid = True  # Flag for current white line validity
+        # Проверка белой линии
+        self.min_lane_width_px = 400.0
+        self.right_distance_history = []
+        self.history_length = 10
+        self.max_jump_threshold_px = 150.0
+        self.white_line_valid = True
         
-        # Grid costs
-        self.forbidden_cost = 1000.0  # Lane boundaries
-        self.obstacle_cost = 100.0    # Physical obstacles
+        # Цены для сетки
+        self.forbidden_cost = 1000.0  # границы полосы
+        self.obstacle_cost = 100.0    # физические препятствия
         
-        # Control parameters
-        self.speed = 0.12 # Slower for cones
-        self.steering_gain = 1.0 # Reduced proportionally
-        self.look_ahead_distance = 0.5 # Increased from 0.4 for smoother path following
+        # Управление
+        self.speed = 0.12
+        self.steering_gain = 1.0
+        self.look_ahead_distance = 0.5
         
-        # Smart rotation parameters
-        self.rotation_speed = 0.15  # rad/s - Very slow rotation
-        self.no_path_start_time = None  # Track how long we've been stuck
-        self.max_rotation_time = 10.0  # Doubled since rotation is 2x slower
-        self.rotating_mode = False  # Are we in rotation mode?
+        # Вращение когда нет пути
+        self.rotation_speed = 0.15
+        self.no_path_start_time = None
+        self.max_rotation_time = 10.0
+        self.rotating_mode = False
         
-        # Debug
+        # Отладка
         self.lidar_received = False
         self.obstacle_count = 0
         
-        # Control timer
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.status_timer = self.create_timer(2.0, self.log_status)  # Every 2s
+        self.status_timer = self.create_timer(2.0, self.log_status)
 
-        # Activation state
+        # Активация
         self.declare_parameter('enable_on_start', True)
         self.is_active = self.get_parameter('enable_on_start').value
         if not self.is_active:
-            self.get_logger().info("Waiting for activation signal on /tunnel/entered...")
+            self.get_logger().info("Ожидание сигнала активации на /tunnel/entered...")
 
-        self.get_logger().info('=== Grid Navigator with Reactive Rotation ===' )
-        self.get_logger().info(f'Min passage width: {self.min_passage_width}m ({int(self.min_passage_width/self.grid_resolution)} cells)')
-        self.get_logger().info(f'White line validation: min_width={self.min_lane_width_px}px, max_jump={self.max_jump_threshold_px}px')
-        self.get_logger().info(f'Rotation: {self.rotation_speed} rad/s (~6°/s VERY SLOW), max time: {self.max_rotation_time}s')
-        self.get_logger().info(f'Publishing to: /avoid_control, /avoid_active')
+        self.get_logger().info('=== Навигатор с сеткой занятости ===' )
+        self.get_logger().info(f'Минимальная ширина прохода: {self.min_passage_width}м ({int(self.min_passage_width/self.grid_resolution)} клеток)')
+        self.get_logger().info(f'Скорость вращения: {self.rotation_speed} рад/с, макс. время: {self.max_rotation_time}с')
+        self.get_logger().info(f'Публикация: /avoid_control, /avoid_active')
 
     def tunnel_entered_callback(self, msg):
         if msg.data and not self.is_active:
             self.is_active = True
-            self.get_logger().info("ACTIVATED by /tunnel/entered signal!")
+            self.get_logger().info("АКТИВИРОВАН сигналом /tunnel/entered!")
 
     def pixel_counts_callback(self, msg):
         self.white_pixels = msg.x
@@ -125,31 +118,25 @@ class OccupancyGridNavigator(Node):
         return pixel_distance / self.pixels_per_meter
 
     def validate_white_line(self):
-        """
-        Validates white line detection.
-        Disabled to trust vision more.
-        """
+        """Проверка валидности белой линии - отключена"""
         return True
 
     def get_lane_boundaries_in_meters(self):
-        """
-        Calculate lane boundaries with smart white line validation.
-        """
+        """Вычисляет границы полосы в метрах"""
         left_boundary = 999.0
         right_boundary = -999.0
         
-        # Yellow line (left) - always trusted
+        # Желтая линия слева - всегда доверяем
         if self.left_distance < 999.0:
             left_boundary = self.pixels_to_meters(self.left_distance) + self.lane_boundary_margin
         
-        # White line (right) - validated
+        # Белая линия справа - с проверкой
         if self.right_distance < 999.0:
             if self.white_line_valid:
                 right_boundary = -(self.pixels_to_meters(self.right_distance) + self.lane_boundary_margin)
             else:
-                # White line rejected - ignore it
                 right_boundary = -999.0
-                self.get_logger().debug('[LANE] Using yellow line only (white rejected)', throttle_duration_sec=2.0)
+                self.get_logger().debug('[LANE] Используем только желтую линию', throttle_duration_sec=2.0)
             
         return left_boundary, right_boundary
 
@@ -173,24 +160,14 @@ class OccupancyGridNavigator(Node):
         return (x, y)
 
     def is_passage_wide_enough(self, grid_pos, min_width_meters=None):
-        """
-        Checks if passage is wide enough for robot at given position.
-        
-        Args:
-            grid_pos: (row, col) position on grid
-            min_width_meters: minimum width (uses self.min_passage_width if None)
-        
-        Returns:
-            bool: True if passage is sufficiently wide
-        """
+        """Проверка достаточной ширины прохода"""
         if min_width_meters is None:
             min_width_meters = self.min_passage_width
             
         row, col = grid_pos
         min_width_cells = int(min_width_meters / self.grid_resolution)
         
-        # Check width along Y axis (perpendicular to forward direction)
-        # Go left from current position
+        # Проверяем ширину по оси Y
         left_extent = 0
         for c in range(col - 1, -1, -1):
             if self.occupancy_grid[row, c] >= self.forbidden_cost:
@@ -199,7 +176,6 @@ class OccupancyGridNavigator(Node):
             if left_extent >= min_width_cells // 2:
                 break
         
-        # Go right from current position
         right_extent = 0
         for c in range(col + 1, self.grid_w):
             if self.occupancy_grid[row, c] >= self.forbidden_cost:
@@ -208,15 +184,12 @@ class OccupancyGridNavigator(Node):
             if right_extent >= min_width_cells // 2:
                 break
         
-        total_width_cells = left_extent + 1 + right_extent  # +1 for current cell
+        total_width_cells = left_extent + 1 + right_extent
         
         return total_width_cells >= min_width_cells
 
     def try_find_path(self):
-        """
-        Try to find a valid path. Returns path if found, empty list otherwise.
-        This is called both during normal operation AND during rotation.
-        """
+        """Пробуем найти путь"""
         goal_grid = None
         min_width_cells = int(self.min_passage_width / self.grid_resolution)
         
@@ -227,17 +200,16 @@ class OccupancyGridNavigator(Node):
             if row >= self.grid_h:
                 continue
             
-            # Get free cells in this row
+            # Находим свободные клетки в этом ряду
             free_cols = []
             for col in range(self.grid_w):
                 if self.occupancy_grid[row, col] < self.obstacle_cost:
                     free_cols.append(col)
             
-            # Require minimum width
             if len(free_cols) < min_width_cells:
                 continue
             
-            # Find contiguous segments
+            # Ищем непрерывные сегменты
             segments = []
             if not free_cols:
                 continue
@@ -247,28 +219,25 @@ class OccupancyGridNavigator(Node):
                 if free_cols[i] == free_cols[i-1] + 1:
                     current_segment.append(free_cols[i])
                 else:
-                    # Only save wide segments
                     if len(current_segment) >= min_width_cells:
                         segments.append(current_segment)
                     current_segment = [free_cols[i]]
             
-            # Check last segment
             if len(current_segment) >= min_width_cells:
                 segments.append(current_segment)
             
             if not segments:
                 continue
             
-            # Pick the widest segment
+            # Берем самый широкий сегмент
             best_segment = max(segments, key=len)
             goal_col = best_segment[len(best_segment)//2]
             goal_grid = (row, goal_col)
             
-            # Double-check with validation function
             if self.is_passage_wide_enough(goal_grid):
                 break
             else:
-                goal_grid = None  # Reset and try next row
+                goal_grid = None
         
         if goal_grid is None:
             goal_grid = self.world_to_grid(0.5, 0.0)
@@ -283,41 +252,39 @@ class OccupancyGridNavigator(Node):
     def build_occupancy_grid(self, lidar_points, stamp, frame_id):
         self.occupancy_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
         
-        # Get validated boundaries
         left_boundary, right_boundary = self.get_lane_boundaries_in_meters()
         
-        # Draw lanes from paths (Curved)
-        # Left Lane
+        # Рисуем полосы из путей (изогнутые)
+        # Левая полоса
         for point in self.left_lane_path:
             x, y = point
-            y += self.lane_boundary_margin # Shift left
+            y += self.lane_boundary_margin
             grid_pos = self.world_to_grid(x, y)
             if grid_pos is not None:
                 row, col = grid_pos
                 self.occupancy_grid[row, col] = self.forbidden_cost
-                # Slight thickening (1 cell radius) to ensure connectivity
+                # Небольшое утолщение для связности
                 for dr in range(-1, 2):
                     for dc in range(-1, 2):
                         r, c = row + dr, col + dc
                         if 0 <= r < self.grid_h and 0 <= c < self.grid_w:
                             self.occupancy_grid[r, c] = self.forbidden_cost
 
-        # Right Lane
+        # Правая полоса
         for point in self.right_lane_path:
             x, y = point
-            y -= self.lane_boundary_margin # Shift right
+            y -= self.lane_boundary_margin
             grid_pos = self.world_to_grid(x, y)
             if grid_pos is not None:
                 row, col = grid_pos
                 self.occupancy_grid[row, col] = self.forbidden_cost
-                # Slight thickening (1 cell radius) to ensure connectivity
                 for dr in range(-1, 2):
                     for dc in range(-1, 2):
                         r, c = row + dr, col + dc
                         if 0 <= r < self.grid_h and 0 <= c < self.grid_w:
                             self.occupancy_grid[r, c] = self.forbidden_cost
 
-        # Fallback: Draw straight lines if paths are empty but we have distances
+        # Запасной вариант: прямые линии если путей нет
         if not self.left_lane_path and left_boundary < 999.0:
              for row in range(self.grid_h):
                 x, y_dummy = self.grid_to_world(row, 0)
@@ -336,11 +303,9 @@ class OccupancyGridNavigator(Node):
                     if y < right_boundary:
                         self.occupancy_grid[row, col] = self.forbidden_cost
         
-        # Draw obstacles with Gradient Inflation using Distance Transform
-        # 1. Create binary obstacle map (0=Obstacle, 1=Free)
+        # Препятствия с градиентом через Distance Transform
         obstacle_map = np.ones((self.grid_h, self.grid_w), dtype=np.uint8)
         
-        # Mark LiDAR points
         obstacle_points = 0
         for point in lidar_points:
             x, y = point[0], point[1]
@@ -350,32 +315,21 @@ class OccupancyGridNavigator(Node):
                 obstacle_map[row, col] = 0
                 obstacle_points += 1
         
-        # Mark Lane Lines as obstacles too (so we stay away from them)
+        # Границы полос тоже препятствия
         obstacle_map[self.occupancy_grid >= self.forbidden_cost] = 0
         
-        # 2. Compute Distance Transform (distance to nearest 0)
-        # dist_grid contains distance in pixels
+        # Distance Transform
         dist_grid = cv2.distanceTransform(obstacle_map, cv2.DIST_L2, 5)
-        
-        # 3. Convert distance to Cost
-        # dist_m = dist_grid * self.grid_resolution
-        # Cost = 100 if dist < robot_radius
-        # Cost = 100 -> 0 as dist goes from robot_radius -> safety_radius
         
         dist_m = dist_grid * self.grid_resolution
         
-        # Lethal zone
+        # Зоны
         lethal_mask = dist_m < self.robot_radius
-        
-        # Gradient zone
         gradient_mask = (dist_m >= self.robot_radius) & (dist_m < self.safety_radius)
         
-        # Apply costs
-        # Lethal
+        # Применяем цены
         self.occupancy_grid[lethal_mask] = np.maximum(self.occupancy_grid[lethal_mask], self.obstacle_cost)
         
-        # Gradient
-        # factor goes from 1.0 (at robot_radius) to 0.0 (at safety_radius)
         if np.any(gradient_mask):
             factor = (self.safety_radius - dist_m[gradient_mask]) / (self.safety_radius - self.robot_radius)
             gradient_cost = factor * self.obstacle_cost
@@ -408,15 +362,13 @@ class OccupancyGridNavigator(Node):
         self.pub_grid.publish(grid_msg)
 
     def find_path_astar(self, start_pos, goal_pos):
-        """A* pathfinding with passage width validation."""
+        """A* с проверкой ширины прохода"""
         start_row, start_col = start_pos
         goal_row, goal_col = goal_pos
         
-        # Check goal validity
         if self.occupancy_grid[goal_row, goal_col] >= self.forbidden_cost:
             return []
         
-        # Check if goal is in wide enough passage
         if not self.is_passage_wide_enough(goal_pos):
             return []
         
@@ -453,22 +405,14 @@ class OccupancyGridNavigator(Node):
                     
                     cell_cost = self.occupancy_grid[nr, nc]
                     
-                    # Block by cost
                     if cell_cost >= self.forbidden_cost:
                         continue
                     
-                    # Check passage width before adding to open set
                     if not self.is_passage_wide_enough(neighbor):
-                        continue  # Skip narrow passages
+                        continue
                     
                     move_cost = 1.414 if (dr != 0 and dc != 0) else 1.0
                     
-                    # Add weighted cell cost to prefer safer paths
-                    # cell_cost is 0..100. 
-                    # move_cost is ~1.0.
-                    # If we add cell_cost directly (e.g. 50), it's huge penalty.
-                    # We want robot to go through 50 cost ONLY if detour is huge.
-                    # Weight 0.1 means 50 cost = 5 extra cells distance.
                     penalty = cell_cost * 0.1
                     
                     tentative_g = g_score[current] + move_cost + penalty
@@ -525,7 +469,7 @@ class OccupancyGridNavigator(Node):
         x = ranges * np.cos(angles)
         y = ranges * np.sin(angles)
         
-        # Transform to base_link (180 deg rotation)
+        # Поворот на 180 градусов в base_link
         x_robot = -x
         y_robot = -y
         
@@ -553,29 +497,25 @@ class OccupancyGridNavigator(Node):
         self.left_distance = 999.0 if msg.data < 0 else msg.data
 
     def right_distance_callback(self, msg):
-        """Right lane distance with stability tracking."""
+        """Обновление расстояния до правой линии"""
         new_distance = 999.0 if msg.data < 0 else msg.data
         
-        # Add to history
         self.right_distance_history.append(new_distance)
         if len(self.right_distance_history) > self.history_length:
             self.right_distance_history.pop(0)
         
-        # Update raw distance
         self.right_distance = new_distance
         
-        # Validate white line
         self.white_line_valid = self.validate_white_line()
 
     def log_status(self):
-        # Debug info
         obstacles_detected = self.check_obstacles()
         
         self.get_logger().info(
             f'[DEBUG] LiDAR: {"✓" if self.lidar_received else "✗"} | '
-            f'Obstacles in grid: {self.obstacle_count} | '
+            f'Препятствия в сетке: {self.obstacle_count} | '
             f'check_obstacles(): {obstacles_detected} | '
-            f'Mode: {"ROTATE" if self.rotating_mode else "NORMAL"}'
+            f'Режим: {"ВРАЩЕНИЕ" if self.rotating_mode else "НОРМАЛЬНЫЙ"}'
         )
 
     def find_lookahead_point(self):
@@ -603,7 +543,7 @@ class OccupancyGridNavigator(Node):
         return best_point
 
     def check_obstacles(self):
-        """Check for obstacles in forward corridor."""
+        """Проверка препятствий в коридоре впереди"""
         min_x, max_x = 0.0, 1.5
         min_y, max_y = -0.3, 0.3
         
@@ -628,7 +568,7 @@ class OccupancyGridNavigator(Node):
             return
 
         if not self.check_obstacles():
-            # Reset rotation state when clear
+            # Сбрасываем вращение когда чисто
             self.no_path_start_time = None
             self.rotating_mode = False
             
@@ -645,32 +585,31 @@ class OccupancyGridNavigator(Node):
                 self.publish_debug_path([], self.last_frame_id)
             return
 
-        # Try to find path (works both in normal and rotation mode)
+        # Пробуем найти путь
         path = self.try_find_path()
         
         if len(path) == 0:
-            # No path - enter/continue rotation mode
+            # Нет пути - включаем вращение
             if not self.rotating_mode:
-                self.get_logger().warn('[NO PATH] Entering rotation mode...', throttle_duration_sec=1.0)
+                self.get_logger().warn('[НЕТ ПУТИ] Включаем режим вращения...', throttle_duration_sec=1.0)
                 self.rotating_mode = True
                 self.no_path_start_time = time.time()
             
-            # CONTINUOUSLY update rotation direction based on PIXEL COUNTS
-            # More Yellow -> Turn RIGHT (Positive)
-            # More White -> Turn LEFT (Negative)
+            # Направление вращения зависит от количества пикселей
+            # Больше желтых -> поворот вправо (отрицательный)
+            # Больше белых -> поворот влево (положительный)
             
             rotation_dir = 0.0
             
             if self.yellow_pixels > self.white_pixels:
                 rotation_dir = -1.0
-                self.get_logger().info(f'[ROTATE] Yellow ({self.yellow_pixels:.0f}) > White ({self.white_pixels:.0f}) -> Turning RIGHT (-)', throttle_duration_sec=0.5)
+                self.get_logger().info(f'[ВРАЩЕНИЕ] Желтых ({self.yellow_pixels:.0f}) > Белых ({self.white_pixels:.0f}) -> Вправо (-)', throttle_duration_sec=0.5)
             else:
                 rotation_dir = 1.0
-                self.get_logger().info(f'[ROTATE] White ({self.white_pixels:.0f}) > Yellow ({self.yellow_pixels:.0f}) -> Turning LEFT (+)', throttle_duration_sec=0.5)
+                self.get_logger().info(f'[ВРАЩЕНИЕ] Белых ({self.white_pixels:.0f}) > Желтых ({self.yellow_pixels:.0f}) -> Влево (+)', throttle_duration_sec=0.5)
             
             self.current_rotation_dir = rotation_dir * self.rotation_speed
             
-            # Execute rotation
             twist = Twist()
             twist.linear.x = 0.0
             twist.angular.z = self.current_rotation_dir
@@ -686,9 +625,9 @@ class OccupancyGridNavigator(Node):
             
             return
         
-        # Path found!
+        # Путь найден
         if self.rotating_mode:
-            self.get_logger().info('[PATH FOUND] Exiting rotation mode!', throttle_duration_sec=0.5)
+            self.get_logger().info('[ПУТЬ НАЙДЕН] Выходим из режима вращения!', throttle_duration_sec=0.5)
         
         self.rotating_mode = False
         self.no_path_start_time = None
