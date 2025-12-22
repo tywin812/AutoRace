@@ -17,9 +17,9 @@ class FinishDetector(Node):
         
         self.bridge = CvBridge()
         
-        # Subscriptions
+        # Subscriptions - исправленный топик
         self.sub_image = self.create_subscription(
-            Image, '/camera/image_raw',
+            Image, '/color/image',
             self.image_callback, 10
         )
         
@@ -27,27 +27,24 @@ class FinishDetector(Node):
         self.pub_finish = self.create_publisher(String, '/robot/finish', 10)
         self.pub_finish_detected = self.create_publisher(Bool, '/finish/detected', 10)
         
-        # Debug publishers для RViz
+        # Debug publishers
         self.pub_debug_edges = self.create_publisher(Image, '/finish/debug/edges', 10)
         self.pub_debug_projection = self.create_publisher(Image, '/finish/debug/projection', 10)
         self.pub_debug_result = self.create_publisher(Image, '/finish/debug/result', 10)
         
-        # Параметры детекции
-        self.min_peaks = 8  # минимум пиков для шахматки
-        self.max_std_dev = 15.0  # максимальное отклонение расстояний между пиками
-        self.min_area_ratio = 0.3  # минимальная ширина паттерна в кадре
+        # Параметры
+        self.min_peaks = 8
+        self.max_std_dev = 15.0
+        self.min_area_ratio = 0.3
+        self.bw_ratio_threshold = 0.6
+        self.detection_threshold = 5
         
-        # Параметры стабильности
         self.detection_count = 0
-        self.detection_threshold = 5  # подряд кадров
         self.finish_detected = False
         
-        # Для проверки черно-белого баланса
-        self.bw_ratio_threshold = 0.6
-        
         self.get_logger().info('=== Finish Detector Started ===')
+        self.get_logger().info(f'Subscribed to: /color/image')
         self.get_logger().info(f'Min peaks: {self.min_peaks}, Max std_dev: {self.max_std_dev}')
-        self.get_logger().info(f'Publishing debug to: /finish/debug/*')
 
     def image_callback(self, msg):
         if self.finish_detected:
@@ -61,7 +58,7 @@ class FinishDetector(Node):
         
         h, w = cv_image.shape[:2]
         
-        # ROI: нижняя половина кадра
+        # ROI: нижняя половина
         roi_start = h // 3
         roi = cv_image[roi_start:, :]
         
@@ -71,8 +68,7 @@ class FinishDetector(Node):
         if is_finish:
             self.detection_count += 1
             self.get_logger().info(
-                f'Финиш обнаружен! Подтверждений: {self.detection_count}/{self.detection_threshold}',
-                throttle_duration_sec=0.5
+                f'Финиш обнаружен! Подтверждений: {self.detection_count}/{self.detection_threshold}'
             )
             
             if self.detection_count >= self.detection_threshold:
@@ -80,29 +76,27 @@ class FinishDetector(Node):
         else:
             self.detection_count = max(0, self.detection_count - 1)
         
-        # Публикация debug информации
         self.publish_debug_info(cv_image, roi, roi_start, is_finish, debug_data)
 
     def detect_checkered_pattern(self, roi):
-        """Детекция шахматного паттерна через градиенты и периодичность"""
         h, w = roi.shape[:2]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        # 1. Детекция границ
+        # 1. Границы
         edges = cv2.Canny(gray, 50, 150)
         
-        # 2. Горизонтальная проекция (суммируем по вертикали)
+        # 2. Горизонтальная проекция
         h_projection = np.sum(edges, axis=0)
         
         # 3. Нормализация
         if np.max(h_projection) > 0:
             h_projection = h_projection / np.max(h_projection)
         
-        # 4. Поиск пиков (вертикальные границы квадратов)
-        peaks, properties = find_peaks(
+        # 4. Поиск пиков
+        peaks, _ = find_peaks(
             h_projection, 
-            height=0.3,  # минимальная высота пика
-            distance=5   # минимальное расстояние между пиками
+            height=0.3,
+            distance=5
         )
         
         debug_data = {
@@ -111,28 +105,25 @@ class FinishDetector(Node):
             'peaks': peaks
         }
         
-        # Проверка количества пиков
         if len(peaks) < self.min_peaks:
             return False, debug_data
         
-        # 5. Проверка периодичности (расстояния между пиками)
+        # 5. Периодичность
         if len(peaks) > 1:
             distances = np.diff(peaks)
             mean_dist = np.mean(distances)
             std_dev = np.std(distances)
             
-            # Коэффициент вариации
             cv = std_dev / mean_dist if mean_dist > 0 else 1.0
             
             debug_data['mean_dist'] = mean_dist
             debug_data['std_dev'] = std_dev
             debug_data['cv'] = cv
             
-            # Если расстояния сильно отличаются -> не периодический паттерн
             if std_dev > self.max_std_dev or cv > 0.5:
                 return False, debug_data
         
-        # 6. Проверка покрытия (паттерн должен занимать значительную часть ширины)
+        # 6. Покрытие
         if len(peaks) > 0:
             pattern_width = peaks[-1] - peaks[0]
             width_ratio = pattern_width / w
@@ -142,12 +133,11 @@ class FinishDetector(Node):
             if width_ratio < self.min_area_ratio:
                 return False, debug_data
         
-        # 7. Проверка черно-белого баланса
+        # 7. Черно-белый баланс
         black_pixels = np.sum(gray < 100)
         white_pixels = np.sum(gray > 150)
-        total_extreme = black_pixels + white_pixels
         
-        if total_extreme > 0:
+        if black_pixels + white_pixels > 0:
             bw_ratio = min(black_pixels, white_pixels) / max(black_pixels, white_pixels)
             debug_data['bw_ratio'] = bw_ratio
             
@@ -157,10 +147,9 @@ class FinishDetector(Node):
         return True, debug_data
 
     def publish_debug_info(self, full_image, roi, roi_start, is_finish, debug_data):
-        """Публикация отладочной информации для RViz"""
         h, w = full_image.shape[:2]
         
-        # 1. Edges visualization
+        # 1. Edges
         if 'edges' in debug_data:
             edges_color = cv2.cvtColor(debug_data['edges'], cv2.COLOR_GRAY2BGR)
             try:
@@ -170,21 +159,18 @@ class FinishDetector(Node):
             except:
                 pass
         
-        # 2. Projection visualization
+        # 2. Projection
         if 'projection' in debug_data:
             projection = debug_data['projection']
             peaks = debug_data['peaks']
             
-            # Создаем изображение графика
             proj_img = np.zeros((200, len(projection), 3), dtype=np.uint8)
             
-            # Рисуем линию проекции
             for i in range(len(projection) - 1):
                 y1 = int(200 - projection[i] * 180)
                 y2 = int(200 - projection[i+1] * 180)
                 cv2.line(proj_img, (i, y1), (i+1, y2), (0, 255, 0), 2)
             
-            # Отмечаем пики
             for peak in peaks:
                 cv2.line(proj_img, (peak, 0), (peak, 200), (0, 0, 255), 2)
             
@@ -195,13 +181,11 @@ class FinishDetector(Node):
             except:
                 pass
         
-        # 3. Result visualization
+        # 3. Result
         result_img = full_image.copy()
         
-        # Отметить ROI
         cv2.rectangle(result_img, (0, roi_start), (w, h), (255, 255, 0), 2)
         
-        # Статус
         status_color = (0, 255, 0) if is_finish else (0, 0, 255)
         status_text = "FINISH DETECTED!" if is_finish else "Searching..."
         cv2.putText(
@@ -210,7 +194,6 @@ class FinishDetector(Node):
             1.0, status_color, 2
         )
         
-        # Детали детекции
         y_offset = 60
         if 'peaks' in debug_data:
             cv2.putText(
@@ -243,7 +226,6 @@ class FinishDetector(Node):
                 0.6, (255, 255, 255), 1
             )
         
-        # Счетчик подтверждений
         cv2.putText(
             result_img, f"Confirm: {self.detection_count}/{self.detection_threshold}",
             (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX,
@@ -261,12 +243,10 @@ class FinishDetector(Node):
         if not self.finish_detected:
             self.finish_detected = True
             
-            # Публикуем в топик соревнования
             finish_msg = String()
             finish_msg.data = "finish"
             self.pub_finish.publish(finish_msg)
             
-            # Внутренний флаг
             detected_msg = Bool()
             detected_msg.data = True
             self.pub_finish_detected.publish(detected_msg)
