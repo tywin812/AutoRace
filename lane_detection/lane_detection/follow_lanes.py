@@ -18,18 +18,8 @@ class ControlLane(Node):
             1
         )
 
-        self.sub_avoid_cmd = self.create_subscription(
-            Twist,
-            '/avoid_control',
-            self.callback_avoid_cmd,
-            1
-        )
-
-        self.sub_avoid_active = self.create_subscription(
-            Bool,
-            '/avoid_active',
-            self.callback_avoid_active,
-            1
+        self.sub_control_active = self.create_subscription(
+            Bool, '/lane_control_active', self.callback_control_active, 1
         )
 
         self.pub_cmd_vel = self.create_publisher(
@@ -39,22 +29,26 @@ class ControlLane(Node):
         )
 
         self.last_error = 0
-        self.integral_error = 0
 
         self.base_speed = 0.6
         self.first_callback = True 
 
-        self.avoid_active = False
-        self.avoid_twist = Twist()
+        self.control_active = True
+
+    def callback_control_active(self, msg):
+        self.control_active = msg.data
+        if not self.control_active:
+            self.get_logger().info("Lane control deactivated")
 
     def callback_follow_lane(self, msg):
-        if self.avoid_active:
-            return
 
+        if not self.control_active:
+            return
+        
         error = msg.data
 
-        Kp = 1.5 #1.4
-        Kd = 0.8 #0.6
+        Kp = 1.5 
+        Kd = 1.0 
 
         if self.first_callback:
             angular_z = Kp * error
@@ -71,19 +65,6 @@ class ControlLane(Node):
         twist.linear.x = min(max(self.base_speed * speed_factor, -0.85), 0.85)
         twist.angular.z = -max(min(angular_z, 1.0), -1.0)
         self.pub_cmd_vel.publish(twist)
-
-    def callback_avoid_cmd(self, twist_msg):
-        self.avoid_twist = twist_msg
-
-        if self.avoid_active:
-            self.pub_cmd_vel.publish(self.avoid_twist)
-
-    def callback_avoid_active(self, bool_msg):
-        self.avoid_active = bool_msg.data
-        if self.avoid_active:
-            self.get_logger().info('Avoidance mode activated.')
-        else:
-            self.get_logger().info('Avoidance mode deactivated. Returning to lane following.')
 
     def shut_down(self):
         self.get_logger().info('Shutting down. cmd_vel will be 0')
