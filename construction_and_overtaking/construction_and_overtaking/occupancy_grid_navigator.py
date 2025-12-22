@@ -6,7 +6,6 @@ from std_msgs.msg import Float64, Bool, Header
 from geometry_msgs.msg import Twist, PoseStamped, Point
 from nav_msgs.msg import OccupancyGrid, Path, MapMetaData
 import numpy as np
-import time
 import cv2
 
 
@@ -20,7 +19,6 @@ class OccupancyGridNavigator(Node):
         self.sub_scan = self.create_subscription(LaserScan, '/scan', self.lidar_callback, 10)
         self.sub_left_distance = self.create_subscription(Float64, '/lane_left_distance', self.left_distance_callback, 10)
         self.sub_right_distance = self.create_subscription(Float64, '/lane_right_distance', self.right_distance_callback, 10)
-        self.sub_tunnel_entered = self.create_subscription(Bool, '/tunnel/entered', self.tunnel_entered_callback, 10)
         
         self.sub_left_path = self.create_subscription(Path, '/detect/lane_left_path', self.left_path_callback, 10)
         self.sub_right_path = self.create_subscription(Path, '/detect/lane_right_path', self.right_path_callback, 10)
@@ -75,20 +73,11 @@ class OccupancyGridNavigator(Node):
         self.rotating_mode = False
         
         self.lidar_received = False
-        self.obstacle_count = 0
         
         self.timer = self.create_timer(0.1, self.control_loop)
         self.status_timer = self.create_timer(2.0, self.log_status)
 
-        self.declare_parameter('enable_on_start', True)
-        self.is_active = self.get_parameter('enable_on_start').value
-
         self.get_logger().info('=== Навигатор с сеткой занятости ===')
-
-    def tunnel_entered_callback(self, msg):
-        if msg.data and not self.is_active:
-            self.is_active = True
-            self.get_logger().info("Активирован!")
 
     def pixel_counts_callback(self, msg):
         self.white_pixels = msg.x
@@ -266,14 +255,12 @@ class OccupancyGridNavigator(Node):
         # Препятствия с градиентом
         obstacle_map = np.ones((self.grid_h, self.grid_w), dtype=np.uint8)
         
-        obstacle_points = 0
         for point in lidar_points:
             x, y = point[0], point[1]
             grid_pos = self.world_to_grid(x, y)
             if grid_pos is not None:
                 row, col = grid_pos
                 obstacle_map[row, col] = 0
-                obstacle_points += 1
         
         obstacle_map[self.occupancy_grid >= self.forbidden_cost] = 0
         
@@ -290,7 +277,6 @@ class OccupancyGridNavigator(Node):
             gradient_cost = factor * self.obstacle_cost
             self.occupancy_grid[gradient_mask] = np.maximum(self.occupancy_grid[gradient_mask], gradient_cost)
         
-        self.obstacle_count = obstacle_points
         self.publish_debug_grid(stamp, frame_id)
 
     def publish_debug_grid(self, stamp, frame_id):
@@ -429,7 +415,6 @@ class OccupancyGridNavigator(Node):
         
         lidar_points = np.column_stack([x_robot[mask], y_robot[mask]])
         self.last_frame_id = "robot/base_link"
-        self.last_scan_time = scan_msg.header.stamp
         self.build_occupancy_grid(lidar_points, scan_msg.header.stamp, "robot/base_link")
 
     def left_path_callback(self, msg):
@@ -509,9 +494,6 @@ class OccupancyGridNavigator(Node):
         return is_obstacle
 
     def control_loop(self):
-        if not self.is_active:
-            return
-
         if not self.check_obstacles():
             self.rotating_mode = False
             
