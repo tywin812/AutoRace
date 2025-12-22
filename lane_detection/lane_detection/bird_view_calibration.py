@@ -23,7 +23,7 @@ class ImageCalibration(Node):
                 ('camera.extrinsic_camera_calibration.top_y', 240, descriptor_y),
                 ('camera.extrinsic_camera_calibration.bottom_x', 410, descriptor_x),
                 ('camera.extrinsic_camera_calibration.bottom_y', 480, descriptor_y),
-                ('is_calibration_mode', True)
+                ('is_calibration_mode', False)
             ]
         )
 

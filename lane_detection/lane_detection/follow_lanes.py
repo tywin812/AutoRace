@@ -38,7 +38,7 @@ class ControlLane(Node):
     def callback_control_active(self, msg):
         self.control_active = msg.data
         if not self.control_active:
-            self.get_logger().info("Lane control deactivated")
+            self.get_logger().debug("Lane control deactivated")
 
     def callback_follow_lane(self, msg):
 
@@ -67,7 +67,7 @@ class ControlLane(Node):
         self.pub_cmd_vel.publish(twist)
 
     def shut_down(self):
-        self.get_logger().info('Shutting down. cmd_vel will be 0')
+        self.get_logger().debug('Shutting down. cmd_vel will be 0')
         twist = Twist()
         self.pub_cmd_vel.publish(twist)
 

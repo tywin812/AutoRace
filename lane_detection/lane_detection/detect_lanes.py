@@ -207,7 +207,7 @@ class DetectLane(Node):
             vis_image = self._visualize(bgr_image, target_x_list, final_target_x)
             self.pub_image_lane.publish(self.cvBridge.cv2_to_imgmsg(vis_image, 'bgr8'))
         else:
-            self.get_logger().warn('No lanes detected on any row!')
+            self.get_logger().debug('No lanes detected on any row!')
     
     def _calculate_target_for_row(self, cx_white, cx_yellow):
         if cx_white is not None and cx_yellow is not None:
