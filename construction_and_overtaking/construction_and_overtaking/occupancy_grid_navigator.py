@@ -27,8 +27,8 @@ class OccupancyGridNavigator(Node):
         self.sub_pixel_counts = self.create_subscription(Point, '/detect/lane_pixel_counts', self.pixel_counts_callback, 10)
 
         # Publishers
-        self.pub_cmd = self.create_publisher(Twist, '/avoid_control', 10)
-        self.pub_avoid_active = self.create_publisher(Bool, '/avoid_active', 10)
+        self.pub_cmd_vel = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.pub_lane_active = self.create_publisher(Bool, '/lane_control_active', 10)
         
         self.pub_grid = self.create_publisher(OccupancyGrid, '/debug/grid', 10)
         self.pub_path = self.create_publisher(Path, '/debug/path', 10)
@@ -454,8 +454,7 @@ class OccupancyGridNavigator(Node):
         obstacles_detected = self.check_obstacles()
         self.get_logger().info(
             f'[DEBUG] LiDAR: {"✓" if self.lidar_received else "✗"} | '
-            f'Препятствия: {self.obstacle_count} | '
-            f'check_obstacles(): {obstacles_detected} | '
+            f'CheckObs: {obstacles_detected} | '
             f'Режим: {"ВРАЩЕНИЕ" if self.rotating_mode else "НОРМА"} | '
             f'Pixels: W={self.white_pixels:.0f} Y={self.yellow_pixels:.0f}'
         )
@@ -502,7 +501,12 @@ class OccupancyGridNavigator(Node):
             return False
             
         roi = self.occupancy_grid[start_row:end_row, start_col:end_col]
-        return np.any(roi == self.obstacle_cost)
+        
+        # Filter noise: require at least 15 pixels of obstacles
+        obstacle_pixels = np.count_nonzero(roi >= self.obstacle_cost)
+        is_obstacle = obstacle_pixels > 15
+        
+        return is_obstacle
 
     def control_loop(self):
         if not self.is_active:
@@ -511,9 +515,10 @@ class OccupancyGridNavigator(Node):
         if not self.check_obstacles():
             self.rotating_mode = False
             
-            avoid_active = Bool()
-            avoid_active.data = False
-            self.pub_avoid_active.publish(avoid_active)
+            # Obstacles cleared -> Re-enable Lane Control
+            lane_active = Bool()
+            lane_active.data = True
+            self.pub_lane_active.publish(lane_active)
             
             self.current_path = []
             if hasattr(self, 'last_frame_id'):
@@ -540,11 +545,12 @@ class OccupancyGridNavigator(Node):
             twist = Twist()
             twist.linear.x = 0.0
             twist.angular.z = rotation_dir * self.rotation_speed
-            self.pub_cmd.publish(twist)
+            self.pub_cmd_vel.publish(twist)
             
-            avoid_active = Bool()
-            avoid_active.data = True
-            self.pub_avoid_active.publish(avoid_active)
+            # Taking control -> Disable Lane Control
+            lane_active = Bool()
+            lane_active.data = False
+            self.pub_lane_active.publish(lane_active)
             
             return
         
@@ -580,7 +586,7 @@ class OccupancyGridNavigator(Node):
         target = self.find_lookahead_point()
         
         if target is None:
-            self.pub_cmd.publish(Twist())
+            self.pub_cmd_vel.publish(Twist())
             return
         
         target_x, target_y = target
@@ -591,11 +597,12 @@ class OccupancyGridNavigator(Node):
         twist.angular.z = self.steering_gain * angle_to_target
         twist.angular.z = np.clip(twist.angular.z, -1.5, 1.5)
         
-        self.pub_cmd.publish(twist)
+        self.pub_cmd_vel.publish(twist)
         
-        avoid_active = Bool()
-        avoid_active.data = True
-        self.pub_avoid_active.publish(avoid_active)
+        # Taking control -> Disable Lane Control
+        lane_active = Bool()
+        lane_active.data = False
+        self.pub_lane_active.publish(lane_active)
 
 
 def main(args=None):

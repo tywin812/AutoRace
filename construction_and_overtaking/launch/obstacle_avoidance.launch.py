@@ -8,26 +8,8 @@ import os
 
 def generate_launch_description():
 
-    bird_view_node = Node(
-        package='lane_detection',
-        executable='bird_view',
-        name='bird_view',
-        output='screen'
-    )
-
-    detect_lanes_node = Node(
-        package='lane_detection',
-        executable='detect_lanes',
-        name='detect_lanes',
-        output='screen'
-    )
-
-    follow_lanes_node = Node(
-        package='lane_detection',
-        executable='follow_lanes',
-        name='follow_lanes',
-        output='screen'
-    )
+    # Note: bird_view, detect_lanes, and follow_lanes are already launched by robot_bringup/autorace_2025.launch.py
+    # We only launch the navigator here to avoid conflicts.
 
     obstacle_avoidance_node = Node(
         package='construction_and_overtaking',
@@ -38,8 +20,5 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        bird_view_node,
-        detect_lanes_node,
-        follow_lanes_node,
         obstacle_avoidance_node
     ])
