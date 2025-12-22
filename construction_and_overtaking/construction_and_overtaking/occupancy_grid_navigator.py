@@ -29,7 +29,6 @@ class OccupancyGridNavigator(Node):
         # Publishers
         self.pub_cmd = self.create_publisher(Twist, '/avoid_control', 10)
         self.pub_avoid_active = self.create_publisher(Bool, '/avoid_active', 10)
-        self.pub_max_vel = self.create_publisher(Float64, '/control/max_vel', 10)
         
         self.pub_grid = self.create_publisher(OccupancyGrid, '/debug/grid', 10)
         self.pub_path = self.create_publisher(Path, '/debug/path', 10)
@@ -457,7 +456,8 @@ class OccupancyGridNavigator(Node):
             f'[DEBUG] LiDAR: {"✓" if self.lidar_received else "✗"} | '
             f'Препятствия: {self.obstacle_count} | '
             f'check_obstacles(): {obstacles_detected} | '
-            f'Режим: {"ВРАЩЕНИЕ" if self.rotating_mode else "НОРМА"}'
+            f'Режим: {"ВРАЩЕНИЕ" if self.rotating_mode else "НОРМА"} | '
+            f'Pixels: W={self.white_pixels:.0f} Y={self.yellow_pixels:.0f}'
         )
 
     def find_lookahead_point(self):
@@ -515,10 +515,6 @@ class OccupancyGridNavigator(Node):
             avoid_active.data = False
             self.pub_avoid_active.publish(avoid_active)
             
-            max_vel = Float64()
-            max_vel.data = 0.22 
-            self.pub_max_vel.publish(max_vel)
-            
             self.current_path = []
             if hasattr(self, 'last_frame_id'):
                 self.publish_debug_path([], self.last_frame_id)
@@ -531,7 +527,15 @@ class OccupancyGridNavigator(Node):
                 self.get_logger().warn('[НЕТ ПУТИ] Включаем вращение', throttle_duration_sec=1.0)
                 self.rotating_mode = True
             
-            rotation_dir = -1.0 if self.yellow_pixels > self.white_pixels else 1.0
+            # FIX: Inverted rotation logic
+            # If more white pixels (right side) -> turn LEFT to find the line
+            # If more yellow pixels (left side) -> turn RIGHT to find the line
+            if self.white_pixels > self.yellow_pixels:
+                rotation_dir = -1.0  # Turn LEFT
+                self.get_logger().debug(f'More white ({self.white_pixels:.0f}) -> turning LEFT')
+            else:
+                rotation_dir = 1.0   # Turn RIGHT
+                self.get_logger().debug(f'More yellow ({self.yellow_pixels:.0f}) -> turning RIGHT')
             
             twist = Twist()
             twist.linear.x = 0.0
@@ -541,10 +545,6 @@ class OccupancyGridNavigator(Node):
             avoid_active = Bool()
             avoid_active.data = True
             self.pub_avoid_active.publish(avoid_active)
-            
-            max_vel = Float64()
-            max_vel.data = 0.0
-            self.pub_max_vel.publish(max_vel)
             
             return
         
@@ -596,10 +596,6 @@ class OccupancyGridNavigator(Node):
         avoid_active = Bool()
         avoid_active.data = True
         self.pub_avoid_active.publish(avoid_active)
-        
-        max_vel = Float64()
-        max_vel.data = self.speed
-        self.pub_max_vel.publish(max_vel)
 
 
 def main(args=None):
