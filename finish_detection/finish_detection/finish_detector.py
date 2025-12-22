@@ -34,8 +34,8 @@ class FinishDetector(Node):
         
         # Параметры
         self.min_peaks = 8  # Increased from 6
-        self.max_std_dev = 12.0 # Tightened from 15.0
-        self.min_area_ratio = 0.3 # Tightened from 0.2
+        self.max_std_dev = 20.0 # Tightened from 15.0
+        self.min_area_ratio = 0.2 # Tightened from 0.2
         self.bw_ratio_threshold = 0.6
         self.detection_threshold = 1 # Increased from 3
         
@@ -140,8 +140,8 @@ class FinishDetector(Node):
         # 4. Поиск пиков
         peaks, _ = find_peaks(
             h_projection, 
-            height=0.4, # Increased from 0.3
-            distance=5
+            height=0.2, # Increased from 0.3
+            distance=3
         )
         
         debug_data = {
