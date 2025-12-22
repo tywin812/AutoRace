@@ -68,13 +68,21 @@ class FinishDetector(Node):
         roi_start = int(h * 2 / 3)
         roi = cv_image[roi_start:, :]
         
+        # ЧИСТАЯ статистика ROI (БЕЗ пиков!)
+        roi_stats = self.analyze_roi_colors(roi)
+        
         # Детекция
         is_finish, debug_data = self.detect_checkered_pattern(roi)
+        
+        # Добавляем ROI stats в debug_data
+        debug_data.update(roi_stats)
         
         # Logging every 10 frames
         self.log_count += 1
         if self.log_count >= 10:
             self.log_count = 0
+            
+            # Статистика детекции
             peaks_count = len(debug_data.get('peaks', []))
             std_dev = debug_data.get('std_dev', 0)
             width_ratio = debug_data.get('width_ratio', 0)
@@ -92,23 +100,22 @@ class FinishDetector(Node):
                 f"B/W: {bw_ratio:.2f}/0.4"
             )
             
-            # Log brightness statistics
-            if 'brightness_stats' in debug_data:
-                bs = debug_data['brightness_stats']
-                self.get_logger().info(
-                    f'📊 Brightness | Min: {bs["min"]:.0f} Max: {bs["max"]:.0f} '
-                    f'Mean: {bs["mean"]:.0f} Median: {bs["median"]:.0f}'
-                )
+            # ЧИСТАЯ статистика ROI
+            self.get_logger().info(
+                f'🎨 [ROI PURE] Brightness | Min: {roi_stats["brightness_min"]:.0f} '
+                f'Max: {roi_stats["brightness_max"]:.0f} '
+                f'Mean: {roi_stats["brightness_mean"]:.0f} '
+                f'Median: {roi_stats["brightness_median"]:.0f}'
+            )
             
-            if 'brightness_distribution' in debug_data:
-                bd = debug_data['brightness_distribution']
-                self.get_logger().info(
-                    f'📊 Distribution | VDark(<50): {bd["very_dark_pct"]:.1f}% '
-                    f'Dark(50-100): {bd["dark_pct"]:.1f}% '
-                    f'Med(100-150): {bd["medium_pct"]:.1f}% '
-                    f'Light(150-200): {bd["light_pct"]:.1f}% '
-                    f'VLight(>200): {bd["very_light_pct"]:.1f}%'
-                )
+            self.get_logger().info(
+                f'🎨 [ROI PURE] Distribution | '
+                f'VDark(<50): {roi_stats["very_dark_pct"]:.1f}% '
+                f'Dark(50-100): {roi_stats["dark_pct"]:.1f}% '
+                f'Med(100-150): {roi_stats["medium_pct"]:.1f}% '
+                f'Light(150-200): {roi_stats["light_pct"]:.1f}% '
+                f'VLight(>200): {roi_stats["very_light_pct"]:.1f}%'
+            )
         
         if is_finish:
             self.detection_count += 1
@@ -124,18 +131,16 @@ class FinishDetector(Node):
         # Always publish debug info (removed subscriber check)
         self.publish_debug_info(cv_image, roi, roi_start, is_finish, debug_data)
 
-    def detect_checkered_pattern(self, roi):
-        h, w = roi.shape[:2]
+    def analyze_roi_colors(self, roi):
+        """Анализ цветов во всей ROI без проверок"""
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        # Анализ распределения яркости BEFORE equalization
-        brightness_stats = {
-            'min': np.min(gray),
-            'max': np.max(gray),
-            'mean': np.mean(gray),
-            'median': np.median(gray),
-            'std': np.std(gray)
-        }
+        # Статистика яркости
+        brightness_min = np.min(gray)
+        brightness_max = np.max(gray)
+        brightness_mean = np.mean(gray)
+        brightness_median = np.median(gray)
+        brightness_std = np.std(gray)
         
         # Подсчет пикселей по диапазонам
         very_dark = np.sum(gray < 50)      # Очень темные (черные)
@@ -145,13 +150,29 @@ class FinishDetector(Node):
         very_light = np.sum(gray >= 200)   # Очень светлые (белые)
         
         total_pixels = gray.size
-        brightness_distribution = {
+        
+        return {
+            'brightness_min': brightness_min,
+            'brightness_max': brightness_max,
+            'brightness_mean': brightness_mean,
+            'brightness_median': brightness_median,
+            'brightness_std': brightness_std,
             'very_dark_pct': (very_dark / total_pixels) * 100,
             'dark_pct': (dark / total_pixels) * 100,
             'medium_pct': (medium / total_pixels) * 100,
             'light_pct': (light / total_pixels) * 100,
-            'very_light_pct': (very_light / total_pixels) * 100
+            'very_light_pct': (very_light / total_pixels) * 100,
+            'very_dark_count': very_dark,
+            'dark_count': dark,
+            'medium_count': medium,
+            'light_count': light,
+            'very_light_count': very_light,
+            'total_pixels': total_pixels
         }
+
+    def detect_checkered_pattern(self, roi):
+        h, w = roi.shape[:2]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
         # Check for overexposure
         mean_brightness = np.mean(gray)
@@ -177,9 +198,7 @@ class FinishDetector(Node):
              return False, {
                  'edges': edges, 
                  'projection': h_projection, 
-                 'peaks': [],
-                 'brightness_stats': brightness_stats,
-                 'brightness_distribution': brightness_distribution
+                 'peaks': []
              }
 
         # 3. Нормализация
@@ -196,9 +215,7 @@ class FinishDetector(Node):
         debug_data = {
             'edges': edges,
             'projection': h_projection,
-            'peaks': peaks,
-            'brightness_stats': brightness_stats,
-            'brightness_distribution': brightness_distribution
+            'peaks': peaks
         }
         
         if len(peaks) < self.min_peaks:
