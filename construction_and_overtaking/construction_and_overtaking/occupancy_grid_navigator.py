@@ -27,8 +27,9 @@ class OccupancyGridNavigator(Node):
         self.sub_pixel_counts = self.create_subscription(Point, '/detect/lane_pixel_counts', self.pixel_counts_callback, 10)
 
         # Publishers
-        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 1)
-        self.pub_control_active = self.create_publisher(Bool, '/lane_control_active', 1)
+        self.pub_cmd = self.create_publisher(Twist, '/avoid_control', 10)
+        self.pub_avoid_active = self.create_publisher(Bool, '/avoid_active', 10)
+        self.pub_max_vel = self.create_publisher(Float64, '/control/max_vel', 10)
         
         self.pub_grid = self.create_publisher(OccupancyGrid, '/debug/grid', 10)
         self.pub_path = self.create_publisher(Path, '/debug/path', 10)
@@ -510,9 +511,13 @@ class OccupancyGridNavigator(Node):
         if not self.check_obstacles():
             self.rotating_mode = False
             
-            control_active = Bool()
-            control_active.data = True
-            self.pub_control_active.publish(control_active)
+            avoid_active = Bool()
+            avoid_active.data = False
+            self.pub_avoid_active.publish(avoid_active)
+            
+            max_vel = Float64()
+            max_vel.data = 0.22 
+            self.pub_max_vel.publish(max_vel)
             
             self.current_path = []
             if hasattr(self, 'last_frame_id'):
@@ -528,14 +533,18 @@ class OccupancyGridNavigator(Node):
             
             rotation_dir = -1.0 if self.yellow_pixels > self.white_pixels else 1.0
             
-            control_active = Bool()
-            control_active.data = False
-            self.pub_control_active.publish(control_active)
-            
             twist = Twist()
             twist.linear.x = 0.0
             twist.angular.z = rotation_dir * self.rotation_speed
             self.pub_cmd.publish(twist)
+            
+            avoid_active = Bool()
+            avoid_active.data = True
+            self.pub_avoid_active.publish(avoid_active)
+            
+            max_vel = Float64()
+            max_vel.data = 0.0
+            self.pub_max_vel.publish(max_vel)
             
             return
         
@@ -576,10 +585,6 @@ class OccupancyGridNavigator(Node):
         
         target_x, target_y = target
         
-        control_active = Bool()
-        control_active.data = False
-        self.pub_control_active.publish(control_active)
-        
         twist = Twist()
         twist.linear.x = self.speed
         angle_to_target = np.arctan2(target_y, target_x)
@@ -587,6 +592,14 @@ class OccupancyGridNavigator(Node):
         twist.angular.z = np.clip(twist.angular.z, -1.5, 1.5)
         
         self.pub_cmd.publish(twist)
+        
+        avoid_active = Bool()
+        avoid_active.data = True
+        self.pub_avoid_active.publish(avoid_active)
+        
+        max_vel = Float64()
+        max_vel.data = self.speed
+        self.pub_max_vel.publish(max_vel)
 
 
 def main(args=None):
