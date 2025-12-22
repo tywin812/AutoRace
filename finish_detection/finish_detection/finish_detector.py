@@ -42,6 +42,7 @@ class FinishDetector(Node):
         self.detection_count = 0
         self.finish_detected = False
         self.frame_count = 0
+        self.log_count = 0
         
         self.get_logger().info('=== Finish Detector Started ===')
         self.get_logger().info(f'Subscribed to: /color/image')
@@ -52,9 +53,8 @@ class FinishDetector(Node):
             return
         
         self.frame_count += 1
-        # Process only every 3rd frame to save resources and avoid freezing RViz
-        if self.frame_count % 3 != 0:
-            return
+        # Process every frame for better detection
+        # (removed frame skip optimization)
             
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -71,6 +71,27 @@ class FinishDetector(Node):
         # Детекция
         is_finish, debug_data = self.detect_checkered_pattern(roi)
         
+        # Logging every 10 frames
+        self.log_count += 1
+        if self.log_count >= 10:
+            self.log_count = 0
+            peaks_count = len(debug_data.get('peaks', []))
+            std_dev = debug_data.get('std_dev', 0)
+            width_ratio = debug_data.get('width_ratio', 0)
+            mean_sat = debug_data.get('mean_saturation', 0)
+            black_ratio = debug_data.get('black_ratio', 0)
+            bw_ratio = debug_data.get('bw_ratio', 0)
+            
+            status = "✅ FINISH!" if is_finish else "🔍 Searching"
+            self.get_logger().info(
+                f"{status} | Peaks: {peaks_count}/{self.min_peaks} | "
+                f"Std: {std_dev:.1f}/{self.max_std_dev} | "
+                f"Width: {width_ratio:.2f}/{self.min_area_ratio} | "
+                f"Sat: {mean_sat:.1f}/50 | "
+                f"Black: {black_ratio:.2f}/0.05 | "
+                f"B/W: {bw_ratio:.2f}/0.4"
+            )
+        
         if is_finish:
             self.detection_count += 1
             self.get_logger().info(
@@ -82,6 +103,7 @@ class FinishDetector(Node):
         else:
             self.detection_count = max(0, self.detection_count - 1)
         
+        # Always publish debug info (removed subscriber check)
         self.publish_debug_info(cv_image, roi, roi_start, is_finish, debug_data)
 
     def detect_checkered_pattern(self, roi):
@@ -208,30 +230,21 @@ class FinishDetector(Node):
         return True, debug_data
 
     def publish_debug_info(self, full_image, roi, roi_start, is_finish, debug_data):
-        # Optimization: Check if anyone is listening before doing heavy work
-        has_edges_sub = self.pub_debug_edges.get_subscription_count() > 0
-        has_proj_sub = self.pub_debug_projection.get_subscription_count() > 0
-        has_result_sub = self.pub_debug_result.get_subscription_count() > 0
-        
-        if not (has_edges_sub or has_proj_sub or has_result_sub):
-            return
-
+        # Always publish debug images (removed subscriber check optimization)
         h, w = full_image.shape[:2]
         
         # 1. Edges
-        if has_edges_sub and 'edges' in debug_data:
+        if 'edges' in debug_data:
             edges_color = cv2.cvtColor(debug_data['edges'], cv2.COLOR_GRAY2BGR)
-            # Resize to reduce bandwidth
-            edges_small = cv2.resize(edges_color, (0,0), fx=0.5, fy=0.5)
             try:
                 self.pub_debug_edges.publish(
-                    self.bridge.cv2_to_imgmsg(edges_small, "bgr8")
+                    self.bridge.cv2_to_imgmsg(edges_color, "bgr8")
                 )
             except:
                 pass
         
         # 2. Projection
-        if has_proj_sub and 'projection' in debug_data:
+        if 'projection' in debug_data:
             projection = debug_data['projection']
             peaks = debug_data['peaks']
             
@@ -245,111 +258,113 @@ class FinishDetector(Node):
             for peak in peaks:
                 cv2.line(proj_img, (peak, 0), (peak, 200), (0, 0, 255), 2)
             
-            # Resize
-            proj_small = cv2.resize(proj_img, (0,0), fx=0.5, fy=0.5)
             try:
                 self.pub_debug_projection.publish(
-                    self.bridge.cv2_to_imgmsg(proj_small, "bgr8")
+                    self.bridge.cv2_to_imgmsg(proj_img, "bgr8")
                 )
             except:
                 pass
         
         # 3. Result
-        if has_result_sub:
-            result_img = full_image.copy()
+        result_img = full_image.copy()
+        
+        # Draw ROI rectangle
+        cv2.rectangle(result_img, (0, roi_start), (w, h), (255, 255, 0), 2)
+        
+        # Draw detected area if peaks found
+        if 'peaks' in debug_data and len(debug_data['peaks']) > 0:
+            peaks = debug_data['peaks']
+            x_start = peaks[0]
+            x_end = peaks[-1]
             
-            # Draw ROI rectangle
-            cv2.rectangle(result_img, (0, roi_start), (w, h), (255, 255, 0), 2)
+            # Draw bounding box around the pattern
+            # Color depends on whether it's considered a valid finish
+            box_color = (0, 255, 0) if is_finish else (0, 0, 255)
+            cv2.rectangle(result_img, (x_start, roi_start), (x_end, h), box_color, 3)
             
-            # Draw detected area if peaks found
-            if 'peaks' in debug_data and len(debug_data['peaks']) > 0:
-                peaks = debug_data['peaks']
-                x_start = peaks[0]
-                x_end = peaks[-1]
-                
-                # Draw bounding box around the pattern
-                # Color depends on whether it's considered a valid finish
-                box_color = (0, 255, 0) if is_finish else (0, 0, 255)
-                cv2.rectangle(result_img, (x_start, roi_start), (x_end, h), box_color, 3)
-                
-                # Draw vertical lines for each peak
-                for peak in peaks:
-                    cv2.line(result_img, (peak, roi_start), (peak, h), (255, 0, 255), 1)
+            # Draw vertical lines for each peak
+            for peak in peaks:
+                cv2.line(result_img, (peak, roi_start), (peak, h), (255, 0, 255), 1)
 
-            status_color = (0, 255, 0) if is_finish else (0, 0, 255)
-            status_text = "FINISH DETECTED!" if is_finish else "Searching..."
+        status_color = (0, 255, 0) if is_finish else (0, 0, 255)
+        status_text = "FINISH DETECTED!" if is_finish else "Searching..."
+        cv2.putText(
+            result_img, status_text,
+            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+            1.0, status_color, 2
+        )
+        
+        y_offset = 60
+        if 'peaks' in debug_data:
+            color = (0, 255, 0) if len(debug_data['peaks']) >= self.min_peaks else (0, 0, 255)
             cv2.putText(
-                result_img, status_text,
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                1.0, status_color, 2
+                result_img, f"Peaks: {len(debug_data['peaks'])}/{self.min_peaks}",
+                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, color, 1
             )
-            
-            y_offset = 60
-            if 'peaks' in debug_data:
-                cv2.putText(
-                    result_img, f"Peaks: {len(debug_data['peaks'])}",
-                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (255, 255, 255), 1
-                )
-                y_offset += 25
-            
-            if 'std_dev' in debug_data:
-                cv2.putText(
-                    result_img, f"Std Dev: {debug_data['std_dev']:.1f}",
-                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (255, 255, 255), 1
-                )
-                y_offset += 25
-            
-            if 'width_ratio' in debug_data:
-                cv2.putText(
-                    result_img, f"Width: {debug_data['width_ratio']:.2f}",
-                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (255, 255, 255), 1
-                )
-                y_offset += 25
-
-            if 'mean_saturation' in debug_data:
-                sat = debug_data['mean_saturation']
-                color = (0, 255, 0) if sat <= 50 else (0, 0, 255)
-                cv2.putText(
-                    result_img, f"Sat: {sat:.1f}",
-                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 1
-                )
-                y_offset += 25
-            
-            if 'black_ratio' in debug_data:
-                br = debug_data['black_ratio']
-                color = (0, 255, 0) if br >= 0.05 else (0, 0, 255)
-                cv2.putText(
-                    result_img, f"True Black: {br:.2f}",
-                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 1
-                )
-                y_offset += 25
-
-            if 'bw_ratio' in debug_data:
-                cv2.putText(
-                    result_img, f"B/W: {debug_data['bw_ratio']:.2f}",
-                    (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (255, 255, 255), 1
-                )
-            
+            y_offset += 25
+        
+        if 'std_dev' in debug_data:
+            std = debug_data['std_dev']
+            color = (0, 255, 0) if std <= self.max_std_dev else (0, 0, 255)
             cv2.putText(
-                result_img, f"Confirm: {self.detection_count}/{self.detection_threshold}",
-                (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (255, 255, 0), 1
+                result_img, f"Std Dev: {std:.1f}/{self.max_std_dev}",
+                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, color, 1
             )
-            
-            # Resize
-            result_small = cv2.resize(result_img, (0,0), fx=0.5, fy=0.5)
-            try:
-                self.pub_debug_result.publish(
-                    self.bridge.cv2_to_imgmsg(result_small, "bgr8")
-                )
-            except:
-                pass
+            y_offset += 25
+        
+        if 'width_ratio' in debug_data:
+            wr = debug_data['width_ratio']
+            color = (0, 255, 0) if wr >= self.min_area_ratio else (0, 0, 255)
+            cv2.putText(
+                result_img, f"Width: {wr:.2f}/{self.min_area_ratio}",
+                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, color, 1
+            )
+            y_offset += 25
+
+        if 'mean_saturation' in debug_data:
+            sat = debug_data['mean_saturation']
+            color = (0, 255, 0) if sat <= 50 else (0, 0, 255)
+            cv2.putText(
+                result_img, f"Sat: {sat:.1f}/50",
+                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, color, 1
+            )
+            y_offset += 25
+        
+        if 'black_ratio' in debug_data:
+            br = debug_data['black_ratio']
+            color = (0, 255, 0) if br >= 0.05 else (0, 0, 255)
+            cv2.putText(
+                result_img, f"True Black: {br:.2f}/0.05",
+                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, color, 1
+            )
+            y_offset += 25
+
+        if 'bw_ratio' in debug_data:
+            bw = debug_data['bw_ratio']
+            color = (0, 255, 0) if bw >= 0.4 else (0, 0, 255)
+            cv2.putText(
+                result_img, f"B/W: {bw:.2f}/0.4",
+                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, color, 1
+            )
+        
+        cv2.putText(
+            result_img, f"Confirm: {self.detection_count}/{self.detection_threshold}",
+            (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX,
+            0.6, (255, 255, 0), 1
+        )
+        
+        try:
+            self.pub_debug_result.publish(
+                self.bridge.cv2_to_imgmsg(result_img, "bgr8")
+            )
+        except:
+            pass
 
     def publish_finish(self):
         if not self.finish_detected:
