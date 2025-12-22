@@ -3,39 +3,45 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
+
+    bird_view_node = Node(
+        package='lane_detection',
+        executable='bird_view',
+        name='bird_view',
+        output='screen'
+    )
+
+    detect_lanes_node = Node(
+        package='lane_detection',
+        executable='detect_lanes',
+        name='detect_lanes',
+        output='screen'
+    )
+
+    follow_lanes_node = Node(
+        package='lane_detection',
+        executable='follow_lanes',
+        name='follow_lanes',
+        output='screen'
+    )
+
+    detect_signes_node = Node(
+        package='sign_detection',
+        executable='detect_sign',
+        name='detect_sign'
+    )
+
+    race_controller_node = Node(
+        package='autorace_core_erevan',
+        executable='race_controller',
+        name='race_controller',
+        output='screen'
+    )
+    
     return LaunchDescription([
-        # Bird-eye view calibration
-        Node(
-            package='lane_detection',
-            executable='bird_view_calibration',
-            name='bird_view_calibration',
-        ),
-        
-        # Lane detection
-        Node(
-            package='lane_detection',
-            executable='detect_lanes',
-            name='detect_lanes',
-        ),
-        
-        # Sign detection (YOLO)
-        Node(
-            package='sign_detection',
-            executable='detect_sign',
-            name='detect_sign'
-        ),
-        
-        # Race State Machine (ГЛАВНЫЙ КОНТРОЛЛЕР)
-        Node(
-            package='race_controller',
-            executable='race_state_machine',
-            name='race_state_machine',
-            parameters=[{
-                'base_speed': 0.6,
-                'turn_speed': 0.3,
-                'sign_confidence_threshold': 0.80,
-                'sign_cooldown_time': 3.0
-            }],
-            output='screen'
-        ),
+        bird_view_node,
+        detect_lanes_node,
+        follow_lanes_node,
+        detect_signes_node,
+        race_controller_node,
     ])
