@@ -70,13 +70,11 @@ class TrafficLightDetector(Node):
 
         if state == TrafficLightState.GREEN:
             self.get_logger().info("Traffic light GREEN detected")
-
-            self.finished = True
+            self.destroy_subscription(self.subscription)
             self.create_timer(0.5, self.shutdown)
 
     def shutdown(self):
         self.get_logger().info("Traffic light estimator finished")
-        self.destroy_subscription(self.subscription)
         self.destroy_node()
         rclpy.shutdown()
 
@@ -85,8 +83,6 @@ def main(args=None):
     rclpy.init(args=args)
     node = TrafficLightDetector()
     rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
 
 
 if __name__ == '__main__':
