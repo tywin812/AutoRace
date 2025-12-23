@@ -1,12 +1,13 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Bool
 from cv_bridge import CvBridge
 import cv2
 import math
 
 from aruco_interfaces.msg import ArucoDetection
+
 
 class ArucoDetector(Node):
     def __init__(self):
@@ -33,14 +34,17 @@ class ArucoDetector(Node):
             20
         )
 
+        self.pub_aruco_complete = self.create_publisher(
+            Bool,
+            '/aruco_mission_complete',
+            1
+        )
 
         self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_6X6_250)
         self.aruco_params = cv2.aruco.DetectorParameters_create()
 
         self.finished = False
         self.min_marker_area = 3500.0
-
-        self.get_logger().info("Aruco detector node started")
 
     def image_callback(self, msg):
         if self.finished:
@@ -77,13 +81,15 @@ class ArucoDetector(Node):
         msg_out.data = sqrt_id
         self.pub.publish(msg_out)
 
-        self.get_logger().info(f"Detected Mission Aruco ID {int(marker_id)}, sqrt={sqrt_id:.5f}")
+        complete_msg = Bool()
+        complete_msg.data = True
+        self.pub_aruco_complete.publish(complete_msg)
         
         self.finished = True
         self.destroy_subscription(self.subscription)
         if self.shutdown_timer is None:
             self.shutdown_timer = self.create_timer(0.1, self.shutdown)
-
+            
     def shutdown(self):
         self.get_logger().info("Aruco detector finished, shutting down")
         if self.shutdown_timer:
