@@ -49,7 +49,7 @@ class ControlLane(Node):
 
     def callback_construction_zone(self, msg):
         if msg.data == True:
-            self.max_vel = 0.45
+            self.max_vel = 0.5
         else:
             self.max_vel = 0.85
 

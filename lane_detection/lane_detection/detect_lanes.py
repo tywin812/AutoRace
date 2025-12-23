@@ -10,6 +10,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Float64
 from std_msgs.msg import UInt8
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped, Point
 
 
 class DetectLane(Node):
@@ -110,8 +112,14 @@ class DetectLane(Node):
                 )
 
         self.pub_lane_error = self.create_publisher(Float64, '/lane_error', 1)
-
         self.pub_lane_state = self.create_publisher(UInt8, '/lane_detection_state', 1)
+        
+        # NEW: Publishers for occupancy grid navigator
+        self.pub_left_distance = self.create_publisher(Float64, '/lane_left_distance', 1)
+        self.pub_right_distance = self.create_publisher(Float64, '/lane_right_distance', 1)
+        self.pub_left_path = self.create_publisher(Path, '/detect/lane_left_path', 1)
+        self.pub_right_path = self.create_publisher(Path, '/detect/lane_right_path', 1)
+        self.pub_pixel_counts = self.create_publisher(Point, '/detect/lane_pixel_counts', 1)
 
         self.cvBridge = CvBridge()
 
@@ -172,6 +180,20 @@ class DetectLane(Node):
         white_mask = self.maskWhiteLane(hsv_image)
         yellow_mask = self.maskYellowLane(hsv_image)
         
+        # Count pixels for occupancy grid navigator
+        white_pixel_count = np.count_nonzero(white_mask)
+        yellow_pixel_count = np.count_nonzero(yellow_mask)
+        
+        # Publish pixel counts
+        pixel_counts = Point()
+        pixel_counts.x = float(white_pixel_count)
+        pixel_counts.y = float(yellow_pixel_count)
+        pixel_counts.z = 0.0
+        self.pub_pixel_counts.publish(pixel_counts)
+        
+        # Collect centroids from all detection rows
+        yellow_centroids = []
+        white_centroids = []
         target_x_list = []
         weights_used = []
         
@@ -186,19 +208,46 @@ class DetectLane(Node):
             cx_white = self._getCentroid(white_row)
             cx_yellow = self._getCentroid(yellow_row)
             
+            if cx_white is not None:
+                white_centroids.append(cx_white)
+            if cx_yellow is not None:
+                yellow_centroids.append(cx_yellow)
+            
             target_x = self._calculate_target_for_row(cx_white, cx_yellow)
             
             if target_x is not None:
                 target_x_list.append(target_x)
                 weights_used.append(self.row_weights[i])
         
+        # Publish lane distances
+        image_center = w / 2
+        
+        left_dist_msg = Float64()
+        if len(yellow_centroids) > 0:
+            avg_yellow = np.mean(yellow_centroids)
+            left_dist_msg.data = float(image_center - avg_yellow)
+        else:
+            left_dist_msg.data = -1.0
+        self.pub_left_distance.publish(left_dist_msg)
+        
+        right_dist_msg = Float64()
+        if len(white_centroids) > 0:
+            avg_white = np.mean(white_centroids)
+            right_dist_msg.data = float(avg_white - image_center)
+        else:
+            right_dist_msg.data = -1.0
+        self.pub_right_distance.publish(right_dist_msg)
+        
+        # Publish lane paths
+        self._publish_lane_paths(yellow_mask, white_mask, h, w, image_center)
+        
+        # Calculate and publish lane error
         if len(target_x_list) > 0:
             weights_array = np.array(weights_used)
             weights_array = weights_array / np.sum(weights_array)  
             
             final_target_x = np.sum(np.array(target_x_list) * weights_array)
             
-            image_center = w / 2
             error = final_target_x - image_center
             normalized_error = error / image_center
             
@@ -208,6 +257,62 @@ class DetectLane(Node):
             self.pub_image_lane.publish(self.cvBridge.cv2_to_imgmsg(vis_image, 'bgr8'))
         else:
             self.get_logger().debug('No lanes detected on any row!')
+    
+    def _publish_lane_paths(self, yellow_mask, white_mask, h, w, image_center):
+        """Publish lane paths for occupancy grid navigator"""
+        ppm = 750.0  # pixels per meter (approx 450px = 0.6m)
+        y_cutoff = int(h * 0.4)  # Skip far points (top of image)
+        sample_step = 5  # Sample every 5 pixels
+        
+        # Yellow lane (left) path
+        if np.count_nonzero(yellow_mask) > 1000:
+            path_msg = Path()
+            path_msg.header.frame_id = 'robot/base_link'
+            path_msg.header.stamp = self.get_clock().now().to_msg()
+            
+            for y_px in range(y_cutoff, h, sample_step):
+                row = yellow_mask[y_px, :]
+                nz = np.nonzero(row)[0]
+                if len(nz) > 0:
+                    x_px = np.mean(nz)
+                    
+                    # Convert to robot frame (bottom-center origin)
+                    x_robot = (h - y_px) / ppm
+                    y_robot = (image_center - x_px) / ppm
+                    
+                    pose = PoseStamped()
+                    pose.header = path_msg.header
+                    pose.pose.position.x = x_robot
+                    pose.pose.position.y = y_robot
+                    pose.pose.position.z = 0.0
+                    path_msg.poses.append(pose)
+            
+            self.pub_left_path.publish(path_msg)
+        
+        # White lane (right) path
+        if np.count_nonzero(white_mask) > 1000:
+            path_msg = Path()
+            path_msg.header.frame_id = 'robot/base_link'
+            path_msg.header.stamp = self.get_clock().now().to_msg()
+            
+            for y_px in range(y_cutoff, h, sample_step):
+                row = white_mask[y_px, :]
+                nz = np.nonzero(row)[0]
+                if len(nz) > 0:
+                    x_px = np.mean(nz)
+                    
+                    # Convert to robot frame (bottom-center origin)
+                    x_robot = (h - y_px) / ppm
+                    y_robot = (image_center - x_px) / ppm
+                    
+                    pose = PoseStamped()
+                    pose.header = path_msg.header
+                    pose.pose.position.x = x_robot
+                    pose.pose.position.y = y_robot
+                    pose.pose.position.z = 0.0
+                    path_msg.poses.append(pose)
+            
+            self.pub_right_path.publish(path_msg)
     
     def _calculate_target_for_row(self, cx_white, cx_yellow):
         if cx_white is not None and cx_yellow is not None:
