@@ -1,3 +1,11 @@
+INSTALL.txt
+build/
+install/
+log/
+lane_detection/
+referee_console/
+robot_bringup/
+robot_description/
 # Prerequisites
 *.d
 
