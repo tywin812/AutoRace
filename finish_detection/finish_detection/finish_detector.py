@@ -72,8 +72,8 @@ class FinishDetector(Node):
         return warped
 
     def image_callback(self, msg):
-        if not self.is_active:
-            return
+        # if not self.is_active:
+        #     return
         
         if self.state == "FINISHED":
             self.stop_robot()

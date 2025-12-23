@@ -24,25 +24,19 @@ class HardcodedConstructionPath(Node):
         self.start_pose = None
         self.phase = 0  
         
+
         self.trajectory = [
             {'type': 'forward', 'distance': 0.5, 'speed': 0.20},
-            
+
             {'type': 'turn', 'angle': -2.1, 'speed': 0.1, 'angular': -0.6},
-            
-            {'type': 'forward', 'distance': 0.27, 'speed': 0.20},
-            
-            {'type': 'turn', 'angle': -1.62, 'speed': 0.1, 'angular': 0.6},
-            
-            {'type': 'forward', 'distance': 0.28, 'speed': 0.20},
 
-            {'type': 'turn', 'angle': 1.9, 'speed': 0.1, 'angular': 0.6},
-            
             {'type': 'forward', 'distance': 0.27, 'speed': 0.20},
 
-            {'type': 'turn', 'angle': -1.3, 'speed': 0.1, 'angular': 0.6},
+            {'type': 'turn', 'angle': -1.65, 'speed': 0.1, 'angular': 0.6},
 
-            {'type': 'forward', 'distance': 0.1, 'speed': 0.20},
-            
+            {'type': 'forward', 'distance': 0.27, 'speed': 0.20},
+
+            {'type': 'turn', 'angle': 1.6, 'speed': 0.1, 'angular': 0.6},
         ]
         
         self.timer = self.create_timer(0.05, self.control_loop)
