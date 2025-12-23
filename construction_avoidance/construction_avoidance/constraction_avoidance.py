@@ -99,8 +99,7 @@ class HardcodedConstructionPath(Node):
         
         if self.start_pose is None:
             self.start_pose = self.current_pose
-            self.get_logger().info(f'Phase {self.phase}: {current_phase["type"]} started')
-
+            
         twist = Twist()
 
         if current_phase['type'] == 'forward':
@@ -110,14 +109,9 @@ class HardcodedConstructionPath(Node):
             if distance < target_distance:
                 twist.linear.x = current_phase['speed']
                 twist.angular.z = 0.0
-                self.get_logger().info(
-                    f'Phase {self.phase} FORWARD: {distance:.2f}m / {target_distance:.2f}m',
-                    throttle_duration_sec=0.3
-                )
             else:
                 self.phase += 1
                 self.start_pose = None
-                self.get_logger().info(f'Phase {self.phase - 1} completed!')
                 return
 
         elif current_phase['type'] == 'turn':
@@ -129,14 +123,9 @@ class HardcodedConstructionPath(Node):
             if abs(angle) < abs(target_angle):
                 twist.linear.x = current_phase['speed']
                 twist.angular.z = turn_dir * current_phase['angular']
-                self.get_logger().info(
-                    f'Phase {self.phase} TURN: {math.degrees(angle):.1f}° / {math.degrees(target_angle):.1f}°',
-                    throttle_duration_sec=0.3
-                )
             else:
                 self.phase += 1
                 self.start_pose = None
-                self.get_logger().info(f'Phase {self.phase - 1} completed!')
                 return
 
         self.pub_cmd_vel.publish(twist)
