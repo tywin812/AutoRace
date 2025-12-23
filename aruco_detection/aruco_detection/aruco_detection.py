@@ -45,6 +45,7 @@ class ArucoDetector(Node):
 
         self.finished = False
         self.min_marker_area = 3500.0
+        self.shutdown_timer = None
 
     def image_callback(self, msg):
         if self.finished:
