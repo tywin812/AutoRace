@@ -43,9 +43,14 @@ class RaceController(Node):
             Odometry, '/odom', self.cbOdometry, 1
         )
         
+        self.sub_aruco_complete = self.create_subscription(
+            Bool, '/aruco_mission_complete', self.cbArucoComplete, 1
+        )
+        
         self.pub_cmd_vel = self.create_publisher(Twist, '/cmd_vel', 1)
         self.pub_lane_control_active = self.create_publisher(Bool, '/lane_control_active', 1)
         self.pub_construction = self.create_publisher(Bool, '/construction_area', 1)
+        self.pub_tunnel_detected = self.create_publisher(Bool, '/tunnel_detected', 1)
         
         self.current_state = RaceState.WAIT_FOR_GREEN
         self.detected_sign = None
@@ -53,6 +58,7 @@ class RaceController(Node):
         self.sign_confidence_threshold = 0.85
         self.sign_area_threshold = 0.04
         self.construction_sign_area_threshold = 0.05
+        self.tunnel_sign_area_threshold = 0.04
 
         self.current_pose = None
         self.turn_start_pose = None
@@ -65,8 +71,8 @@ class RaceController(Node):
         self.turn_linear_speed = 0.02 
         self.turn_angular_speed = 0.7
 
-        self.exit_speed = 0.1
-        self.turn_exit_distance = 0.05
+        self.exit_speed = 0.15
+        self.turn_exit_distance = 0.1
         self.turn_phase = None
         
         self.turn_max_time = 10.0
@@ -74,13 +80,23 @@ class RaceController(Node):
         
         self.construction_start_pose = None
         self.construction_activation_distance = 0.8 
-        
+        self.construction_completed = False
+
         self.last_construction_state = False
+        self.tunnel_published = False
         
         self.timer_control = self.create_timer(0.05, self.control_loop)
 
     def cbOdometry(self, msg):
         self.current_pose = msg.pose.pose
+
+    def cbArucoComplete(self, msg):
+        if msg.data and self.current_state == RaceState.CONSTRUCTION_ZONE:
+            self.get_logger().info('Aruco detected - Avoidance zone completed!')
+            self.current_state = RaceState.LANE_FOLLOWING
+            self.construction_start_pose = None
+            self.publish_construction_state(False)
+            self.construction_completed = True
 
     def quaternion_to_yaw(self, q):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
@@ -127,31 +143,30 @@ class RaceController(Node):
         if state != self.last_construction_state:
             self.pub_construction.publish(Bool(data=state))
             self.last_construction_state = state
-            self.get_logger().info(f'Construction area: {state}')
 
     def cbDetection(self, msg):
         if msg.confidence < self.sign_confidence_threshold:
             return
         
+        if msg.class_name == 'construction' and self.construction_completed:
+            return
+        
         sign_area = msg.width * msg.height
+        
+        if msg.class_name == 'tunnel' and not self.tunnel_published:
+            self.get_logger().info('TUNNEL sign detected - activating finish detector!')
+            self.pub_tunnel_detected.publish(Bool(data=True))
+            self.tunnel_published = True
+            return
         
         if msg.class_name == 'construction':
             in_trigger_zone = sign_area > self.construction_sign_area_threshold
         else:
             in_trigger_zone = sign_area > self.sign_area_threshold
         
-        self.get_logger().info(
-            f"Sign '{msg.class_name}': "
-            f"conf={msg.confidence:.2f}, "
-            f"area={sign_area:.3f}, "
-            f"state={self.current_state.name}, "
-            f"trigger={'YES' if in_trigger_zone else 'NO'}"
-        )
-        
         if self.current_state == RaceState.LANE_FOLLOWING:
             self.detected_sign = msg.class_name
             self.current_state = RaceState.SIGN_DETECTED
-            self.get_logger().info(f"Sign '{self.detected_sign}' detected!")
         
         elif self.current_state == RaceState.SIGN_DETECTED:
             if not in_trigger_zone:
@@ -166,7 +181,6 @@ class RaceController(Node):
             return
 
         if msg.state == TrafficLightState.GREEN:
-            self.get_logger().info("GREEN light received - starting race!")
             self.current_state = RaceState.LANE_FOLLOWING
 
     def control_loop(self):
@@ -208,7 +222,8 @@ class RaceController(Node):
             self.construction_start_pose = self.current_pose
             self.current_state = RaceState.CONSTRUCTION_ZONE
             self.publish_construction_state(False) 
-            self.pub_lane_control_active.publish(Bool(data=True)) 
+            self.pub_lane_control_active.publish(Bool(data=True))
+            self.get_logger().info("Entering construction zone")
         
         elif self.current_state == RaceState.CONSTRUCTION_ZONE:
             distance = self.get_construction_distance()
@@ -216,16 +231,9 @@ class RaceController(Node):
             if distance < self.construction_activation_distance:
                 self.pub_lane_control_active.publish(Bool(data=True))
                 self.publish_construction_state(False)
-                self.get_logger().debug(
-                    f"Construction zone - lane following: {distance:.2f}m / {self.construction_activation_distance:.2f}m",
-                    throttle_duration_sec=0.5
-                )
             else:
+                self.pub_lane_control_active.publish(Bool(data=False))
                 self.publish_construction_state(True)
-                self.get_logger().debug(
-                    f"Construction zone - obstacle avoidance ACTIVE (traveled {distance:.2f}m)",
-                    throttle_duration_sec=1.0
-                )
 
     def execute_turn(self):
         twist = Twist()
@@ -234,12 +242,12 @@ class RaceController(Node):
             self.get_logger().warn('No odometry data available!')
             return twist
         
-        # if self.turn_timeout_start:
-        #     elapsed = (self.get_clock().now() - self.turn_timeout_start).nanoseconds / 1e9
-        #     if elapsed > self.turn_max_time:
-        #         self.get_logger().warn('Turn timeout! Forcing lane following')
-        #         self.finish_turn()
-        #         return Twist()
+        if self.turn_timeout_start:
+            elapsed = (self.get_clock().now() - self.turn_timeout_start).nanoseconds / 1e9
+            if elapsed > self.turn_max_time:
+                self.get_logger().warn('Turn timeout! Forcing lane following')
+                self.finish_turn()
+                return Twist()
         
         turn_dir = 1.0 if self.current_state == RaceState.TURNING_LEFT else -1.0
         

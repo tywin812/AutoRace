@@ -57,6 +57,13 @@ def generate_launch_description():
         output='screen'
     )
 
+    finish_detector = Node(
+        package='finish_detection',
+        executable='finish_detector',
+        name='finish_detector',
+        output='screen',    
+    )
+
     return LaunchDescription([
         bird_view_node,
         detect_lanes_node,
@@ -66,4 +73,5 @@ def generate_launch_description():
         traffic_light_node,
         race_controller_node,
         construction_node,
+        finish_detector,
     ])
