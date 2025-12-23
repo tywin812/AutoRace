@@ -27,7 +27,7 @@ class FinishDetector(Node):
             self.tunnel_callback, 1
         )
         
-        self.pub_finish = self.create_publisher(String, '/robot/finish', 10)
+        self.pub_finish = self.create_publisher(String, '/robot_finish', 10)
         self.pub_finish_detected = self.create_publisher(Bool, '/finish/detected', 10)
         self.pub_cmd_vel = self.create_publisher(Twist, '/cmd_vel', 10)
         self.pub_lane_active = self.create_publisher(Bool, '/lane_control_active', 10)
