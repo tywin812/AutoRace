@@ -22,6 +22,13 @@ class ControlLane(Node):
             Bool, '/lane_control_active', self.callback_control_active, 1
         )
 
+        self.sub_construction_zone = self.create_subscription(
+            Bool,
+            '/construction_area',
+            self.callback_construction_zone,
+            1
+        )
+
         self.pub_cmd_vel = self.create_publisher(
             Twist,
             '/cmd_vel',
@@ -32,13 +39,19 @@ class ControlLane(Node):
 
         self.base_speed = 0.6
         self.first_callback = True 
-
+        self.max_vel = 0.85
         self.control_active = True
 
     def callback_control_active(self, msg):
         self.control_active = msg.data
         if not self.control_active:
             self.get_logger().debug("Lane control deactivated")
+
+    def callback_construction_zone(self, msg):
+        if msg.data == True:
+            self.max_vel = 0.5
+        else:
+            self.max_vel = 0.85
 
     def callback_follow_lane(self, msg):
 
@@ -62,7 +75,7 @@ class ControlLane(Node):
         
         twist = Twist()
 
-        twist.linear.x = min(max(self.base_speed * speed_factor, -0.85), 0.85)
+        twist.linear.x = min(max(self.base_speed * speed_factor, -self.max_vel), self.max_vel)
         twist.angular.z = -max(min(angular_z, 1.0), -1.0)
         self.pub_cmd_vel.publish(twist)
 
