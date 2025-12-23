@@ -1,7 +1,7 @@
-# AutoRace 2025
-A ROS2 metapackage that has necessary packages for AutoRace 2025 challenge.
+# EREVAN AutoRace
+A ROS2 metapackage that has a solution of EREVAN team for Autorace competition.
 
-## Usage for EREVAN AutoRace 2025
+## Usage for EREVAN AutoRace
 
 1. Install dependencies
 
