@@ -49,7 +49,14 @@ def generate_launch_description():
         name='race_controller',
         output='screen'
     )
-    
+
+    construction_node = Node(
+        package='construction_avoidance',
+        executable='constraction_avoidance',
+        name='constraction_avoidance',
+        output='screen'
+    )
+
     return LaunchDescription([
         bird_view_node,
         detect_lanes_node,
@@ -58,4 +65,5 @@ def generate_launch_description():
         detect_aruco_node,
         traffic_light_node,
         race_controller_node,
+        construction_node,
     ])

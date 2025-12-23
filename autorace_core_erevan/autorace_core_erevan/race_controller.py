@@ -19,6 +19,7 @@ class RaceState(Enum):
     TURNING_LEFT = 4
     TURNING_RIGHT = 5
     APPROACHING_CONSTRUCTION = 6
+    CONSTRUCTION_ZONE = 7
 
 
 class TurnPhase(Enum):
@@ -71,6 +72,11 @@ class RaceController(Node):
         self.turn_max_time = 10.0
         self.turn_timeout_start = None
         
+        self.construction_start_pose = None
+        self.construction_activation_distance = 0.8 
+        
+        self.last_construction_state = False
+        
         self.timer_control = self.create_timer(0.05, self.control_loop)
 
     def cbOdometry(self, msg):
@@ -90,6 +96,16 @@ class RaceController(Node):
         distance = math.sqrt(dx**2 + dy**2)
         
         return distance
+    
+    def get_construction_distance(self):
+        if not self.construction_start_pose or not self.current_pose:
+            return 0.0
+        
+        dx = self.current_pose.position.x - self.construction_start_pose.position.x
+        dy = self.current_pose.position.y - self.construction_start_pose.position.y
+        distance = math.sqrt(dx**2 + dy**2)
+        
+        return distance
 
     def get_angle_rotated(self):
         if not self.turn_start_pose or not self.current_pose:
@@ -106,6 +122,12 @@ class RaceController(Node):
             angle_diff += 2.0 * math.pi
         
         return abs(angle_diff)
+
+    def publish_construction_state(self, state):
+        if state != self.last_construction_state:
+            self.pub_construction.publish(Bool(data=state))
+            self.last_construction_state = state
+            self.get_logger().info(f'Construction area: {state}')
 
     def cbDetection(self, msg):
         if msg.confidence < self.sign_confidence_threshold:
@@ -150,16 +172,20 @@ class RaceController(Node):
     def control_loop(self):
         if self.current_state == RaceState.WAIT_FOR_GREEN:
             self.pub_lane_control_active.publish(Bool(data=False))
+            self.publish_construction_state(False)
             return
         
         elif self.current_state == RaceState.LANE_FOLLOWING:
             self.pub_lane_control_active.publish(Bool(data=True))
+            self.publish_construction_state(False)
         
         elif self.current_state == RaceState.SIGN_DETECTED:
             self.pub_lane_control_active.publish(Bool(data=True))
+            self.publish_construction_state(False)
         
         elif self.current_state == RaceState.APPROACHING_TURN:
             self.pub_lane_control_active.publish(Bool(data=False))
+            self.publish_construction_state(False)
             
             if self.detected_sign in ['left', 'right']:
                 self.turn_phase = TurnPhase.MOVE_FORWARD
@@ -174,11 +200,32 @@ class RaceController(Node):
                     self.get_logger().info("Starting RIGHT turn")
         
         elif self.current_state in [RaceState.TURNING_LEFT, RaceState.TURNING_RIGHT]:
+            self.publish_construction_state(False)
             twist = self.execute_turn()
             self.pub_cmd_vel.publish(twist)
 
         elif self.current_state == RaceState.APPROACHING_CONSTRUCTION:
-            self.pub_construction.publish(Bool(data=True))
+            self.construction_start_pose = self.current_pose
+            self.current_state = RaceState.CONSTRUCTION_ZONE
+            self.publish_construction_state(False) 
+            self.pub_lane_control_active.publish(Bool(data=True)) 
+        
+        elif self.current_state == RaceState.CONSTRUCTION_ZONE:
+            distance = self.get_construction_distance()
+            
+            if distance < self.construction_activation_distance:
+                self.pub_lane_control_active.publish(Bool(data=True))
+                self.publish_construction_state(False)
+                self.get_logger().debug(
+                    f"Construction zone - lane following: {distance:.2f}m / {self.construction_activation_distance:.2f}m",
+                    throttle_duration_sec=0.5
+                )
+            else:
+                self.publish_construction_state(True)
+                self.get_logger().debug(
+                    f"Construction zone - obstacle avoidance ACTIVE (traveled {distance:.2f}m)",
+                    throttle_duration_sec=1.0
+                )
 
     def execute_turn(self):
         twist = Twist()
@@ -187,12 +234,12 @@ class RaceController(Node):
             self.get_logger().warn('No odometry data available!')
             return twist
         
-        if self.turn_timeout_start:
-            elapsed = (self.get_clock().now() - self.turn_timeout_start).nanoseconds / 1e9
-            if elapsed > self.turn_max_time:
-                self.get_logger().warn('Turn timeout! Forcing lane following')
-                self.finish_turn()
-                return Twist()
+        # if self.turn_timeout_start:
+        #     elapsed = (self.get_clock().now() - self.turn_timeout_start).nanoseconds / 1e9
+        #     if elapsed > self.turn_max_time:
+        #         self.get_logger().warn('Turn timeout! Forcing lane following')
+        #         self.finish_turn()
+        #         return Twist()
         
         turn_dir = 1.0 if self.current_state == RaceState.TURNING_LEFT else -1.0
         
@@ -216,7 +263,7 @@ class RaceController(Node):
             if angle >= (self.turn_target_angle - self.turn_angle_tolerance):
                 self.turn_phase = TurnPhase.MOVE_OUT
                 self.turn_start_pose = self.current_pose  
-                self.get_logger().debug(f'MOVE_OUT - rotated {math.degrees(angle):.1f} degrees')
+                self.get_logger().info(f'MOVE_OUT - rotated {math.degrees(angle):.1f} degrees')
 
         elif self.turn_phase == TurnPhase.MOVE_OUT:
             distance = self.get_distance_traveled()
@@ -226,7 +273,7 @@ class RaceController(Node):
             
             if distance >= self.turn_exit_distance:
                 self.turn_phase = TurnPhase.COMPLETE
-                self.get_logger().debug(f'COMPLETE - moved out {distance:.3f}m')
+                self.get_logger().info(f'COMPLETE - moved out {distance:.3f}m')
     
         elif self.turn_phase == TurnPhase.COMPLETE:
             self.finish_turn()
