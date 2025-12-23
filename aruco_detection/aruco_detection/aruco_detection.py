@@ -81,10 +81,14 @@ class ArucoDetector(Node):
         
         self.finished = True
         self.destroy_subscription(self.subscription)
-        self.create_timer(0.1, self.shutdown)
+        if self.shutdown_timer is None:
+            self.shutdown_timer = self.create_timer(0.1, self.shutdown)
 
     def shutdown(self):
         self.get_logger().info("Aruco detector finished, shutting down")
+        if self.shutdown_timer:
+            self.shutdown_timer.cancel()
+            
         self.destroy_node()
         rclpy.shutdown()
 
@@ -92,8 +96,6 @@ def main(args=None):
     rclpy.init(args=args)
     node = ArucoDetector()
     rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
 
 
 if __name__ == "__main__":
